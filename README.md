@@ -12,6 +12,13 @@ Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and
 
 ## Status
 
+**It has a screen.** `./sim.sh` boots the OS as a simulated device with a
+display, driven by a userspace virtio-gpu driver holding the same five
+capabilities as the block driver. The status screen is drawn by the kernel and
+rendered by an unprivileged process.
+
+![Jungey OS status screen](docs/screenshot.png)
+
 **Stage 5b — inference is scheduled.** Accelerator time has QoS classes,
 deadlines it either accepts or refuses, and preemption at segment boundaries. An
 interactive job arriving while a 150-segment background job is running waits
@@ -74,9 +81,22 @@ its demos finish, so `./run.sh` normally returns on its own in about a second.
 To run every stage's exit test end to end:
 
 ```bash
-./test.sh              # five boots from an empty disk, 26 checks
+./test.sh              # five boots from an empty disk
 ./test.sh --repeat 5   # the whole thing five times over, to shake out races
 ```
+
+To run it as a device with a screen:
+
+```bash
+./sim.sh               # boots with a display, saves frames to screenshots/
+./sim.sh --gui         # opens a window instead, if you have a desktop
+```
+
+QEMU is the simulator in both cases — it emulates the cores, the GIC, the
+timers, the disk and now the display. `sim.sh` adds the display and captures
+frames over QEMU's monitor, so it works on a headless machine. A machine with a
+screen skips the crash-consistency test, because that test deliberately cuts the
+power and there is nothing to look at afterwards.
 
 Expected output (abridged — hardware discovery and the capability demo come
 first; see `docs/ROADMAP.md` for those):
@@ -296,6 +316,7 @@ gdb-multiarch os/kernel/target/aarch64-unknown-none-softfloat/release/jkernel \
 ```
 os/
 ├── run.sh                    build + boot under QEMU
+├── sim.sh                    boot as a device with a screen, capture frames
 ├── test.sh                   every stage's exit test, end to end
 ├── docs/
 │   ├── ARCHITECTURE.md       the design and why it is shaped this way
@@ -305,6 +326,8 @@ os/
 │   └── src/
 │       ├── main.rs           the test roles
 │       ├── blkdrv.rs         the virtio-blk driver — an ordinary process
+│       ├── gpudrv.rs         the virtio-gpu driver — likewise
+│       ├── font.rs           an 8x8 bitmap font, generated from ASCII art
 │       └── sys.rs            syscall stubs — the whole kernel interface
 └── kernel/
     ├── linker.ld             image layout; linked high, loaded at 0x4008_0000
@@ -325,6 +348,7 @@ os/
         ├── fs.rs             JLFS: append-only log, two checkpoint slots
         ├── model.rs          the model store: shared, paged, reclaimable weights
         ├── tensor.rs         the tensor scheduler: QoS, deadlines, preemption
+        ├── display.rs       builds frames; knows nothing about pixels
         ├── dtb.rs            flattened device tree reader
         ├── cap.rs            capabilities: minting, derivation, revocation
         ├── ipc.rs            channels and message queues

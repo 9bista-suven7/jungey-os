@@ -11,6 +11,8 @@
 #![no_main]
 
 mod blkdrv;
+mod font;
+mod gpudrv;
 mod sys;
 
 use sys::*;
@@ -24,6 +26,7 @@ pub const ROLE_MODEL_A: usize = 5;
 pub const ROLE_MODEL_B: usize = 6;
 pub const ROLE_INFER_UI: usize = 7;
 pub const ROLE_INFER_BG: usize = 8;
+pub const ROLE_GPUDRV: usize = 9;
 
 /// Where a mapped model goes in our address space. High enough to be clear of
 /// the image and the heap, low enough to be obviously user memory.
@@ -61,6 +64,7 @@ pub extern "C" fn _start(role: usize) -> ! {
         ROLE_MODEL_B => model_user("  [modelB  ]"),
         ROLE_INFER_UI => infer_interactive(),
         ROLE_INFER_BG => infer_background(),
+        ROLE_GPUDRV => gpudrv::run(),
         _ => write("user: unknown role\n"),
     }
     exit(0)

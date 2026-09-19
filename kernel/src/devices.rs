@@ -23,6 +23,7 @@ const MAGIC_VALUE: u32 = 0x7472_6976; // "virt"
 
 /// virtio device ids worth naming here.
 pub const VIRTIO_BLOCK: u32 = 2;
+pub const VIRTIO_GPU: u32 = 16;
 
 /// A transport slot with something in it.
 #[derive(Clone, Copy)]

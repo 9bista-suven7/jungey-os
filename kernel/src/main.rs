@@ -32,6 +32,7 @@ pub mod syscall;
 pub mod tensor;
 pub mod blk;
 pub mod devices;
+pub mod display;
 pub mod sync;
 pub mod time;
 
@@ -193,7 +194,11 @@ pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
     }
     heap_check("after stage 3b");
     println!("{}", RULE);
-    stage3c_demo();
+    // A machine with a screen is being demonstrated, not tested. The crash test
+    // deliberately cuts the power part way through, which is incompatible with
+    // showing anything — so on such a machine it verifies and stops there.
+    let has_display = devices::find_virtio(&fdt, devices::VIRTIO_GPU).is_some();
+    stage3c_demo(!has_display);
     heap_check("after stage 3c");
     println!("{}", RULE);
     stage5a_demo();
@@ -201,6 +206,13 @@ pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
     println!("{}", RULE);
     stage5b_demo();
     heap_check("after stage 5b");
+
+    // A screen, if the machine has one. `sim.sh` attaches a display; `run.sh`
+    // does not, and everything above works identically either way.
+    if start_display_driver(&fdt) {
+        println!("{}", RULE);
+        show_status_screen();
+    }
 
     println!("{}", RULE);
     if blk::attached() {
@@ -474,6 +486,10 @@ fn heap_check(when: &str) {
 /// Two DMA pages: the virtqueue, and the request header, data and status byte.
 const DMA_PAGES: usize = 2;
 
+/// The display's DMA region: a queue page, a command page, and a 480x960
+/// framebuffer at four bytes a pixel.
+const GPU_DMA_PAGES: usize = 2 + (480 * 960 * 4) / mm::PAGE_SIZE;
+
 fn start_block_driver(fdt: &dtb::Fdt) -> bool {
     let slots = devices::virtio_slots(fdt);
     let Some(found) = devices::find_virtio(fdt, devices::VIRTIO_BLOCK) else {
@@ -531,6 +547,51 @@ fn start_block_driver(fdt: &dtb::Fdt) -> bool {
             false
         }
     }
+}
+
+/// Hand the display to a userspace process, exactly as the disk was.
+///
+/// The interesting part is how little is different: a second device, a very
+/// different protocol, and the same five capabilities. If the framework only
+/// fitted the device it was designed around, this is where that would show.
+fn start_display_driver(fdt: &dtb::Fdt) -> bool {
+    let Some(found) = devices::find_virtio(fdt, devices::VIRTIO_GPU) else {
+        return false;
+    };
+    println!(
+        "  bus        : display in a virtio transport at {:#x}, intid {}",
+        found.node.base, found.node.irq
+    );
+
+    let Some(dma) = mm::frames::alloc_contiguous(GPU_DMA_PAGES) else {
+        println!("  display    : no contiguous memory for a framebuffer");
+        return false;
+    };
+
+    let req = ipc::create();
+    let rep = ipc::create();
+    let caps = [
+        cap::Cap::root(cap::Obj::Channel(req), cap::RIGHT_RECV),
+        cap::Cap::root(cap::Obj::Channel(rep), cap::RIGHT_SEND),
+        cap::Cap::root(
+            cap::Obj::Mmio { base: found.node.base as usize, size: found.node.size as usize },
+            cap::RIGHT_MAP,
+        ),
+        cap::Cap::root(cap::Obj::Irq(found.node.irq), cap::RIGHT_IRQ),
+        cap::Cap::root(cap::Obj::Dma { base: dma, pages: GPU_DMA_PAGES }, cap::RIGHT_MAP),
+    ];
+
+    irq::register_user(found.node.irq);
+    gic::enable_spi(found.node.irq);
+
+    let pid = start_service("gpudrv", 9, &caps);
+    display::attach(req, rep);
+    println!(
+        "  display    : gpudrv is pid {}, {} KiB of framebuffer, same five capabilities",
+        pid,
+        GPU_DMA_PAGES * mm::PAGE_SIZE / 1024
+    );
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -668,7 +729,7 @@ fn verify(fs: &fs::Fs, v: u8, len: usize) -> bool {
 const V1_LEN: usize = 1100; // three sectors, so a partial write is possible
 const V2_LEN: usize = 1600;
 
-fn stage3c_demo() {
+fn stage3c_demo(allow_crash: bool) {
     if !blk::attached() {
         println!("  fs         : no disk, skipping");
         return;
@@ -676,6 +737,28 @@ fn stage3c_demo() {
 
     let phase = fs::read_phase();
     println!("  fs         : crash-consistency test, phase {}", phase);
+
+    if !allow_crash {
+        match mounted() {
+            Ok(f) => {
+                println!("  fs         : mounted checkpoint seq {} from slot {}", f.cp.seq, f.slot);
+                for e in f.files() {
+                    println!("    {:<12} {:>6} bytes at sector {}", e.name_str(), e.size, e.start);
+                }
+                if f.files().is_empty() {
+                    println!("    (empty)");
+                }
+            }
+            Err(()) => {
+                // A fresh disk in simulator mode still needs a filesystem.
+                if fs::format(blk::capacity_sectors()).is_ok() {
+                    println!("  fs         : formatted a fresh filesystem");
+                }
+            }
+        }
+        println!("  fs         : crash test skipped — this machine has a display");
+        return;
+    }
 
     match phase {
         0 => {
@@ -1110,6 +1193,167 @@ fn stage5b_demo() {
             interactive_met, background_preempted, refused, opportunistic_deferred
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The status screen.
+//
+// Not a window system — a device showing what it is doing. Everything on it is
+// read from the subsystems above rather than made up, which is the only reason
+// it is worth putting on a screen at all.
+// ---------------------------------------------------------------------------
+
+const BG: u32 = 0xff0b0e14;
+const PANEL: u32 = 0xff151b26;
+const ACCENT: u32 = 0xff58a6ff;
+const GOOD: u32 = 0xff56d364;
+const WARN: u32 = 0xffe3b341;
+const TEXT: u32 = 0xffd0d7de;
+const DIM: u32 = 0xff7d8590;
+
+/// A panel with a heading. Returns the y where its contents start.
+fn panel(f: &mut display::Frame, y: u16, h: u16, title: &str) -> u16 {
+    f.rect(16, y, 448, h, PANEL);
+    f.rect(16, y, 4, h, ACCENT);
+    f.text(34, y + 14, 1, ACCENT, title);
+    y + 38
+}
+
+fn show_status_screen() {
+    // Ten seconds of live screen. Long enough to watch, and long enough for
+    // `sim.sh` to capture frames without racing the shutdown.
+    let total_frames = 40;
+    for n in 0..total_frames {
+        let mut f = display::Frame::new();
+        f.clear(BG);
+
+        // Header.
+        f.rect(0, 0, 480, 104, PANEL);
+        f.rect(0, 100, 480, 4, ACCENT);
+        f.text(40, 26, 4, TEXT, "JUNGEY OS");
+        f.text(42, 70, 1, DIM, "AARCH64 CAPABILITY MICROKERNEL");
+
+        // Cores.
+        let mut y = panel(&mut f, 126, 150, "CORES");
+        let mut x = 34u16;
+        smp::for_each(|c| {
+            f.rect(x, y, 96, 84, BG);
+            f.text(x + 34, y + 12, 2, GOOD, &alloc::format!("{}", c.id));
+            f.text(x + 10, y + 46, 1, DIM, "TICKS");
+            f.text(x + 10, y + 62, 1, TEXT, &alloc::format!("{}", c.ticks));
+            x += 104;
+        });
+        let _ = y;
+
+        // Memory.
+        y = panel(&mut f, 290, 120, "MEMORY");
+        let total = mm::frames::total_count();
+        let free = mm::frames::free_count();
+        let used = total.saturating_sub(free);
+        let pct = if total > 0 { used * 100 / total } else { 0 };
+        f.rect(34, y, 412, 18, BG);
+        let filled = (412u64 * pct as u64 / 100).max(2) as u16;
+        f.rect(34, y, filled, 18, ACCENT);
+        f.text(
+            34,
+            y + 30,
+            1,
+            TEXT,
+            &alloc::format!(
+                "{} MIB TOTAL   {} MIB USED   {}%",
+                total * 4096 / (1024 * 1024),
+                used * 4096 / (1024 * 1024),
+                pct
+            ),
+        );
+
+        // Model store.
+        y = panel(&mut f, 424, 150, "MODEL STORE");
+        let (faults, shared) = model::fault_totals();
+        f.text(34, y, 1, DIM, "RESIDENT WEIGHT PAGES");
+        f.text(300, y, 2, TEXT, &alloc::format!("{}", model::resident_pages()));
+        f.text(34, y + 34, 1, DIM, "FAULTS / SHARED");
+        f.text(300, y + 34, 2, GOOD, &alloc::format!("{}/{}", faults, shared));
+        f.text(34, y + 68, 1, DIM, "READ FROM FLASH ONCE, USED TWICE");
+
+        // Accelerator.
+        y = panel(&mut f, 588, 246, "ACCELERATOR");
+        f.text(34, y, 1, DIM, "CLASS         SEGS  LATENCY  RESULT");
+        let mut row = y + 20u16;
+        tensor::for_each(|j| {
+            if row > y + 150 {
+                return;
+            }
+            // A refused job never ran, so it has no latency worth showing —
+            // and left alone its "latency" grows forever, which would be the
+            // screen quietly lying.
+            let refused = j.state == tensor::JobState::Refused;
+            let (result, color) = if refused {
+                ("REFUSED", WARN)
+            } else {
+                match j.met_deadline() {
+                    Some(true) => ("MET", GOOD),
+                    Some(false) => ("MISSED", WARN),
+                    None => ("DONE", TEXT),
+                }
+            };
+            let latency = if refused {
+                alloc::string::String::from("      -")
+            } else {
+                alloc::format!("{:>5}MS", j.latency_us() / 1000)
+            };
+            f.text(
+                34,
+                row,
+                1,
+                color,
+                &alloc::format!(
+                    "{:<13} {:>4}  {}  {}",
+                    j.qos.label(),
+                    j.segments,
+                    latency,
+                    result
+                ),
+            );
+            row += 18;
+        });
+        let (segments, refused, preemptions) = tensor::totals();
+        f.text(
+            34,
+            y + 176,
+            1,
+            DIM,
+            &alloc::format!(
+                "{} SEGMENTS  {} PREEMPTIONS  {} REFUSED",
+                segments, preemptions, refused
+            ),
+        );
+
+        // Footer.
+        f.rect(0, 900, 480, 60, PANEL);
+        f.text(
+            22,
+            920,
+            1,
+            DIM,
+            // 60 characters is the width of the screen at this scale.
+            &alloc::format!(
+                "UPTIME {}MS  FRAME {}/{}  USERSPACE DISPLAY DRIVER",
+                time::uptime_ms(),
+                n + 1,
+                total_frames
+            ),
+        );
+
+        if !f.present() {
+            println!("  display    : the server stopped answering");
+            return;
+        }
+        sched::sleep_ticks(25);
+    }
+
+    println!("  display    : {} frames rendered by the userspace driver", display::frames());
+    display::shutdown();
 }
 
 fn current_el() -> u64 {

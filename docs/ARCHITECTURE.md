@@ -199,6 +199,10 @@ first within a class, preemption at segment boundaries, admission control
 against a measured segment cost, and per-job latency and energy accounting. The
 executor behind it is a CPU loop rather than an NPU, and says so.
 
+A display driver now exists alongside the block driver, holding the same five
+capabilities and reaching nothing else — evidence that the driver framework is a
+framework rather than one device's scaffolding.
+
 Section 3.5 does not exist yet — energy is accounted but not yet budgeted
 against, which is stage 5d. What stages 0-2
 buy is the substrate they need: address spaces to map weight pages into, a

@@ -393,6 +393,16 @@ client:**
 
 ## Stage 4 — Graphics, input, the shell
 
+*Partly anticipated by `sim.sh`.* A userspace virtio-gpu driver now puts a
+status screen on a simulated 480x960 display, using the same capability
+framework as the block driver — five capabilities, no way to reach a second
+device. That is a framebuffer and a bitmap font, not a display server: no
+compositor, no input, no windows, and no GPU acceleration. It exists because a
+device that cannot show anything is hard to reason about, and because a second
+driver was the only way to find out whether the stage 3d framework fitted
+anything but the device it was designed around. It did.
+
+
 Display server on DRM/KMS-equivalent, GPU bring-up (Panfrost/Freedreno as
 reference), a compositor, touch input, fonts and text layout, and a first shell.
 This is where it stops being a console and starts being a device.
