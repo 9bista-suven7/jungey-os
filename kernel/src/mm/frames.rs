@@ -1,14 +1,15 @@
 //! Physical frame allocator.
 //!
-//! Stage 0 strategy: bump-allocate upward through the largest usable RAM region,
+//! Strategy: bump-allocate upward through the largest usable RAM region,
 //! stepping over reserved ranges (the kernel image, the device tree blob), with
 //! freed frames pushed onto an intrusive free list stored in the frames
-//! themselves. The MMU is still off, so physical addresses are directly writable.
+//! themselves. Addresses in and out are *physical*; the link words are written
+//! through the higher-half linear map.
 //!
 //! This gets replaced by a buddy allocator once page tables exist — the API here
 //! is deliberately the one a buddy allocator can keep.
 
-use super::{page_align_down, page_align_up, PAGE_SIZE};
+use super::{page_align_down, page_align_up, phys_to_virt, PAGE_SIZE};
 use crate::dtb::Fdt;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -94,7 +95,7 @@ pub fn alloc() -> Option<usize> {
     // Recycled frames first — they are already warm in cache.
     let head = FREE_LIST.load(Ordering::Relaxed);
     if head != 0 {
-        let next = unsafe { core::ptr::read_volatile(head as *const usize) };
+        let next = unsafe { core::ptr::read_volatile(phys_to_virt(head) as *const usize) };
         FREE_LIST.store(next, Ordering::Relaxed);
         FREE_LIST_LEN.fetch_sub(1, Ordering::Relaxed);
         return Some(head);
@@ -116,12 +117,46 @@ pub fn alloc() -> Option<usize> {
     }
 }
 
+/// Hand out `count` *physically contiguous* frames, for callers that need one
+/// run of memory: the kernel heap, DMA buffers, and later the page tables of a
+/// new address space.
+///
+/// Only served from the bump region — recycled frames are not tracked by run
+/// length. Returns the physical base.
+pub fn alloc_contiguous(count: usize) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    let end = END.load(Ordering::Relaxed);
+    loop {
+        let cur = BUMP.load(Ordering::Relaxed);
+        if cur == 0 || cur + count * PAGE_SIZE > end {
+            return None;
+        }
+        // Restart past any reserved range the run would straddle.
+        let mut blocked = None;
+        for i in 0..count {
+            if let Some(skip_to) = blocked_until(cur + i * PAGE_SIZE) {
+                blocked = Some(skip_to);
+                break;
+            }
+        }
+        match blocked {
+            Some(skip_to) => BUMP.store(page_align_up(skip_to), Ordering::Relaxed),
+            None => {
+                BUMP.store(cur + count * PAGE_SIZE, Ordering::Relaxed);
+                return Some(cur);
+            }
+        }
+    }
+}
+
 /// Return a frame to the allocator. The frame's first word becomes the link.
 pub fn free(frame: usize) {
     debug_assert!(frame % PAGE_SIZE == 0, "frame not page aligned");
     debug_assert!(blocked_until(frame).is_none(), "freeing a reserved frame");
     let head = FREE_LIST.load(Ordering::Relaxed);
-    unsafe { core::ptr::write_volatile(frame as *mut usize, head) };
+    unsafe { core::ptr::write_volatile(phys_to_virt(frame) as *mut usize, head) };
     FREE_LIST.store(frame, Ordering::Relaxed);
     FREE_LIST_LEN.fetch_add(1, Ordering::Relaxed);
 }

@@ -22,18 +22,52 @@ the real RAM map, and a frame allocation round-trip. ✅
 
 ---
 
-## Stage 1 — Virtual memory and threads
+## Stage 1 — Virtual memory and threads  ✅ *done*
 
-MMU on (TTBR0/TTBR1 split, 4 KiB granule, 48-bit VA), higher-half kernel, buddy
-allocator, kernel heap, per-thread kernel stacks, a round-robin scheduler on the
-generic timer, GICv3 driver, and an idle thread that actually sleeps the core.
+MMU on (TTBR0/TTBR1 split, 4 KiB granule, 48-bit VA) with the kernel relinked
+into the higher half at `PHYS_OFFSET`; the low half is then unmapped outright
+via `TCR_EL1.EPD0`, so a null dereference faults instead of poking MMIO. Kernel
+heap, GICv3 driver, generic timer at 100 Hz, per-thread kernel stacks,
+preemptive round-robin scheduling, sleeping threads, and an idle thread that
+stops the core in WFI.
 
 **Exit test:** three kernel threads round-robin on a timer tick, a deliberate
 null dereference produces a page fault report naming the faulting address, and
-the core enters WFI when nothing is runnable.
+the core enters WFI when nothing is runnable. ✅
 
-*Cost: 1–2 months. This is the stage where most hobby kernels are abandoned;
-MMU bugs are silent and the debugger is a UART.*
+Measured on QEMU `virt`:
+
+```
+  thread          state  slices        alpha/beta/gamma get 51 slices each
+  boot         runnable      53        over 150 ticks — round-robin is fair
+  idle         runnable       1
+  alpha        finished      51        idle ran 49 times during a 50-tick
+  beta         finished      51        sleep: the core really stopped
+  gamma        finished      51
+  irqs       : 0 spurious, 0 unclaimed
+```
+
+```
+*** EXCEPTION: EL1h sync ***
+  esr_el1 = 0x0000000096000004  (data abort, same EL)
+  far_el1 = 0x0000000000000000
+  fault   : at 0x0000000000000000, translation fault — nothing mapped there
+```
+
+**Two deviations from the original plan, both deliberate:**
+
+- *No buddy allocator.* The plan called for one. Kernel allocation at this stage
+  is low-rate and long-lived, and a buddy allocator answers fragmentation
+  pressure that does not exist yet. The frame allocator grew `alloc_contiguous`
+  for multi-page runs, and the heap is a first-fit free list with coalescing.
+  Revisit when stage 5's weight pages and KV cache make fragmentation real —
+  the callers do not change when the implementation does.
+- *Whole-RAM linear map with 1 GiB blocks*, rather than fine-grained kernel
+  mappings. Four L1 descriptors map everything; per-page kernel permissions
+  (W^X for the kernel image) land with the stage 2 page-table code.
+
+*Cost: was estimated at 1–2 months. This is the stage where most hobby kernels
+are abandoned; MMU bugs are silent and the debugger is a UART.*
 
 ---
 

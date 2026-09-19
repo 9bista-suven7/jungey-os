@@ -169,5 +169,12 @@ the inference server and an app is a capability transfer, not a copy.
 
 ## 7. Current state
 
-Stage 0 is implemented and boots (`os/kernel`). See `ROADMAP.md` for what each
-stage delivers and what it costs.
+Stages 0 and 1 are implemented (`os/kernel`): the kernel boots, runs in the
+higher half with the MMU on, allocates physical and heap memory, takes
+interrupts through a GICv3, and preemptively schedules kernel threads off the
+generic timer.
+
+None of section 3 exists yet — that is stages 5 and 6. What stage 1 buys is the
+substrate they need: an address space to map weight pages into, a scheduler to
+extend with QoS classes, and an interrupt path that will carry accelerator
+completions. See `ROADMAP.md` for what each stage delivers and what it costs.

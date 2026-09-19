@@ -9,8 +9,16 @@
 // Each entry only has room for a register save and a branch, so the real work
 // happens in __exception_common.
 
+// Exception frame: x0-x30 at 0..247, then ELR_EL1 and SPSR_EL1.
+// ELR/SPSR must be in the frame, not left in the system registers: the
+// scheduler switches threads from inside the IRQ handler, and the thread we
+// switch to would otherwise clobber the return state of the one we left.
+.set FRAME_SIZE, 272
+.set FRAME_ELR,  256
+.set FRAME_SPSR, 264
+
 .macro SAVE_REGS
-    sub     sp, sp, #256
+    sub     sp, sp, #FRAME_SIZE
     stp     x0,  x1,  [sp, #16 * 0]
     stp     x2,  x3,  [sp, #16 * 1]
     stp     x4,  x5,  [sp, #16 * 2]
@@ -27,9 +35,15 @@
     stp     x26, x27, [sp, #16 * 13]
     stp     x28, x29, [sp, #16 * 14]
     str     x30,      [sp, #16 * 15]
+    mrs     x9,  elr_el1
+    mrs     x10, spsr_el1
+    stp     x9,  x10, [sp, #FRAME_ELR]
 .endm
 
 .macro RESTORE_REGS
+    ldp     x9,  x10, [sp, #FRAME_ELR]
+    msr     elr_el1,  x9
+    msr     spsr_el1, x10
     ldp     x0,  x1,  [sp, #16 * 0]
     ldp     x2,  x3,  [sp, #16 * 1]
     ldp     x4,  x5,  [sp, #16 * 2]
@@ -46,7 +60,7 @@
     ldp     x26, x27, [sp, #16 * 13]
     ldp     x28, x29, [sp, #16 * 14]
     ldr     x30,      [sp, #16 * 15]
-    add     sp, sp, #256
+    add     sp, sp, #FRAME_SIZE
 .endm
 
 .macro VENTRY idx

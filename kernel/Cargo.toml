@@ -1,12 +1,17 @@
 [package]
 name    = "jungey-kernel"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Jungey OS microkernel (AArch64)"
 
 [[bin]]
 name = "jkernel"
 path = "src/main.rs"
+
+[features]
+# Deliberately dereference a null pointer at the end of the stage 1 demo, to
+# show the low half really is unmapped. `os/run.sh --fault`.
+fault-demo = []
 
 [dependencies]
 

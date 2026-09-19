@@ -1,11 +1,22 @@
 /* Jungey OS kernel image layout.
- * QEMU `virt` puts DRAM at 0x4000_0000; 0x4008_0000 is the conventional
- * kernel load address on AArch64 (leaves the first 512K for firmware/DTB). */
+ *
+ * The kernel is LINKED at a higher-half virtual address but LOADED at a
+ * physical one: QEMU `virt` puts DRAM at 0x4000_0000 and the ARM64 boot
+ * protocol places us at RAM base + text_offset (0x8_0000), so we run at
+ * physical 0x4008_0000 until boot.s turns the MMU on and branches high.
+ *
+ *   VA = PA + 0xFFFF_0000_0000_0000   (mm::PHYS_OFFSET)
+ *
+ * Everything before the MMU is enabled must reach symbols PC-relatively
+ * (adrp/add), which yields the physical address at runtime. See boot.s. */
 ENTRY(_start)
+
+PHYS_BASE  = 0x40080000;
+PHYS_OFFSET = 0xFFFF000000000000;
 
 SECTIONS
 {
-    . = 0x40080000;
+    . = PHYS_OFFSET + PHYS_BASE;
     __kernel_start = .;
 
     .text : {
@@ -38,6 +49,8 @@ SECTIONS
 
     /* Memory footprint advertised in the Image header. */
     __image_size = __kernel_end - __kernel_start;
+    __kernel_start_phys = __kernel_start - PHYS_OFFSET;
+    __kernel_end_phys   = __kernel_end - PHYS_OFFSET;
 
     /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }
 }

@@ -6,9 +6,29 @@
 //! evictable under pressure). See `os/docs/ARCHITECTURE.md`.
 
 pub mod frames;
+pub mod heap;
 
 pub const PAGE_SIZE: usize = 4096;
 pub const PAGE_SHIFT: usize = 12;
+
+/// Base of the higher-half linear map. Every byte of physical RAM is reachable
+/// at `pa + PHYS_OFFSET` once boot.s has enabled the MMU, so the kernel never
+/// needs a temporary mapping to touch a page it just allocated.
+///
+/// Must match `PHYS_OFFSET` in `linker.ld`.
+pub const PHYS_OFFSET: usize = 0xFFFF_0000_0000_0000;
+
+/// Physical address -> kernel virtual address in the linear map.
+#[inline]
+pub const fn phys_to_virt(pa: usize) -> usize {
+    pa + PHYS_OFFSET
+}
+
+/// Kernel virtual address in the linear map -> physical address.
+#[inline]
+pub const fn virt_to_phys(va: usize) -> usize {
+    va - PHYS_OFFSET
+}
 
 #[inline]
 pub const fn page_align_up(addr: usize) -> usize {

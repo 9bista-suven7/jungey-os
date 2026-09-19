@@ -24,6 +24,17 @@ const fn align4(n: usize) -> usize {
     (n + 3) & !3
 }
 
+#[inline]
+fn be32_slice(v: &[u8]) -> u32 {
+    u32::from_be_bytes([v[0], v[1], v[2], v[3]])
+}
+
+/// A `compatible` property is a list of NUL-separated strings, most specific
+/// first. Match if any entry equals `want`.
+fn compat_matches(value: &[u8], want: &str) -> bool {
+    value.split(|&b| b == 0).any(|e| e == want.as_bytes())
+}
+
 /// Read a NUL-terminated string starting at `p`, returning it and its length
 /// including the terminator.
 unsafe fn cstr(p: *const u8) -> (&'static str, usize) {
@@ -93,6 +104,61 @@ impl Fdt {
         let v = self.root_prop("model")?;
         let end = v.iter().position(|&b| b == 0).unwrap_or(v.len());
         core::str::from_utf8(&v[..end]).ok()
+    }
+
+    /// Fill `out` with the `reg` pairs of the first node whose `compatible`
+    /// list contains `compatible`, returning how many were written.
+    ///
+    /// This is how the kernel finds the UART and the interrupt controller
+    /// without believing anything about the board it woke up on.
+    pub fn node_regs(&self, compatible: &str, out: &mut [(u64, u64)]) -> usize {
+        let mut w = Walker::new(self);
+        let mut addr_cells = 2usize;
+        let mut size_cells = 2usize;
+        let mut cur_compat: Option<&'static [u8]> = None;
+        let mut cur_reg: Option<&'static [u8]> = None;
+
+        while let Some(ev) = w.next_event() {
+            match ev {
+                Event::BeginNode { .. } => {
+                    cur_compat = None;
+                    cur_reg = None;
+                }
+                Event::Prop { depth: 1, name: "#address-cells", value } if value.len() >= 4 => {
+                    addr_cells = be32_slice(value) as usize;
+                }
+                Event::Prop { depth: 1, name: "#size-cells", value } if value.len() >= 4 => {
+                    size_cells = be32_slice(value) as usize;
+                }
+                Event::Prop { name, value, .. } => {
+                    match name {
+                        "compatible" => cur_compat = Some(value),
+                        "reg" => cur_reg = Some(value),
+                        _ => {}
+                    }
+                    // Check as soon as both are in hand, rather than at the
+                    // node's end: a matching node may have child nodes.
+                    if let (Some(c), Some(r)) = (cur_compat, cur_reg) {
+                        if compat_matches(c, compatible) {
+                            let stride = (addr_cells + size_cells) * 4;
+                            let mut n = 0;
+                            let mut at = 0;
+                            while at + stride <= r.len() && n < out.len() {
+                                out[n] = (
+                                    MemoryRegions::read_cells(r, at, addr_cells),
+                                    MemoryRegions::read_cells(r, at + addr_cells * 4, size_cells),
+                                );
+                                n += 1;
+                                at += stride;
+                            }
+                            return n;
+                        }
+                    }
+                }
+                Event::EndNode => {}
+            }
+        }
+        0
     }
 
     /// Every `(base, size)` pair from every `/memory` node.

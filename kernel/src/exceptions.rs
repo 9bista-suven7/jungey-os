@@ -43,12 +43,43 @@ fn describe(esr: u64) -> &'static str {
     }
 }
 
+/// Vector index 1, 5, 9 and 13 are the IRQ entries for each of the four
+/// exception origins.
+const fn is_irq(idx: u64) -> bool {
+    idx & 3 == 1
+}
+
 #[no_mangle]
 pub extern "C" fn rust_exception(idx: u64, esr: u64, elr: u64, far: u64, sp: u64) {
+    if is_irq(idx) {
+        crate::irq::dispatch();
+        return;
+    }
+
     println!("\n*** EXCEPTION: {} ***", NAMES[(idx & 15) as usize]);
     println!("  esr_el1 = {:#018x}  ({})", esr, describe(esr));
     println!("  elr_el1 = {:#018x}", elr);
     println!("  far_el1 = {:#018x}", far);
     println!("  sp      = {:#018x}", sp);
-    panic!("unhandled exception in stage 0");
+
+    // A data or instruction abort names the address that faulted; the low bits
+    // of ESR say why the translation failed.
+    let ec = esr >> 26;
+    if matches!(ec, 0b100000 | 0b100001 | 0b100100 | 0b100101) {
+        println!("  fault   : at {:#018x}, {}", far, fault_status(esr & 0x3f));
+    }
+
+    panic!("unhandled exception");
+}
+
+/// Decode the Data/Instruction Fault Status Code.
+fn fault_status(iss: u64) -> &'static str {
+    match iss {
+        0b000100..=0b000111 => "translation fault — nothing mapped there",
+        0b001001..=0b001011 => "access flag fault",
+        0b001101..=0b001111 => "permission fault",
+        0b010000 => "synchronous external abort",
+        0b100001 => "alignment fault",
+        _ => "see ARM ARM D17.2.37",
+    }
 }
