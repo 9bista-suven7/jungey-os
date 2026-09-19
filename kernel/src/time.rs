@@ -40,7 +40,8 @@ pub fn uptime_ms() -> u64 {
     ticks() * 1000 / HZ
 }
 
-/// Program the first interrupt and let it through the GIC.
+/// Program this core's first interrupt and let it through the GIC. Every core
+/// calls this; the generic timer is per-core hardware.
 pub fn start() {
     let interval = frequency() / HZ;
     INTERVAL.store(interval, Ordering::Relaxed);
@@ -51,9 +52,17 @@ pub fn start() {
     gic::enable_ppi(TIMER_INTID);
 }
 
-/// Rearm for the next tick. Called from the IRQ handler.
+/// Rearm for the next tick. Called from each core's IRQ handler.
+///
+/// Every core takes its own timer interrupt, but the system tick counter is
+/// advanced only by the boot core — otherwise four cores would make the clock
+/// run four times as fast, and `sleep_ticks` would be wrong by the core count.
 pub fn rearm() {
     let interval = INTERVAL.load(Ordering::Relaxed);
-    TICKS.fetch_add(1, Ordering::Relaxed);
+    let cpu = crate::smp::this_cpu();
+    cpu.ticks += 1;
+    if cpu.id == 0 {
+        TICKS.fetch_add(1, Ordering::Relaxed);
+    }
     unsafe { core::arch::asm!("msr cntv_tval_el0, {}", in(reg) interval) };
 }

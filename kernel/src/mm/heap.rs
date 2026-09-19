@@ -24,11 +24,16 @@ struct Block {
 const BLOCK_SIZE: usize = core::mem::size_of::<Block>();
 const MIN_ALIGN: usize = core::mem::align_of::<Block>();
 
+/// Donated regions, kept so the free list can be checked against them.
+const MAX_REGIONS: usize = 4;
+
 pub struct Heap {
     /// Address-sorted singly linked list of free blocks.
     head: *mut Block,
     total: usize,
     allocated: usize,
+    regions: [(usize, usize); MAX_REGIONS],
+    region_count: usize,
 }
 
 // Safety: every access goes through the SpinLock below.
@@ -36,7 +41,7 @@ unsafe impl Send for Heap {}
 
 impl Heap {
     const fn new() -> Self {
-        Heap { head: ptr::null_mut(), total: 0, allocated: 0 }
+        Heap { head: ptr::null_mut(), total: 0, allocated: 0, regions: [(0, 0); MAX_REGIONS], region_count: 0 }
     }
 
     /// Donate `[start, start + size)` of kernel-virtual memory to the heap.
@@ -46,6 +51,10 @@ impl Heap {
             return;
         }
         self.total += size;
+        if self.region_count < MAX_REGIONS {
+            self.regions[self.region_count] = (start, start + size);
+            self.region_count += 1;
+        }
         self.insert(start as *mut Block, size);
     }
 
@@ -158,4 +167,61 @@ pub fn init(pages: usize) -> Result<(), &'static str> {
 pub fn stats() -> (usize, usize) {
     let h = HEAP.lock();
     (h.total, h.allocated)
+}
+
+/// What a walk of the free list found.
+pub struct HeapCheck {
+    pub blocks: usize,
+    pub free_bytes: usize,
+    pub error: Option<&'static str>,
+    pub at: usize,
+}
+
+/// Walk the free list and confirm it is still a sorted, non-overlapping list of
+/// blocks inside the donated regions.
+///
+/// Worth having permanently: heap corruption shows up as a fault somewhere else
+/// entirely, often thousands of instructions later, and the only cheap way to
+/// attribute it is to check the structure at known-good points.
+pub fn check() -> HeapCheck {
+    let h = HEAP.lock();
+    let mut out = HeapCheck { blocks: 0, free_bytes: 0, error: None, at: 0 };
+    let mut cur = h.head;
+    let mut last_end = 0usize;
+
+    while !cur.is_null() {
+        let addr = cur as usize;
+        out.at = addr;
+
+        if addr % MIN_ALIGN != 0 {
+            out.error = Some("block is misaligned");
+            return out;
+        }
+        if addr < last_end {
+            out.error = Some("free list is not sorted, or blocks overlap");
+            return out;
+        }
+        let size = unsafe { (*cur).size };
+        if size < BLOCK_SIZE || size > h.total {
+            out.error = Some("block size is impossible");
+            return out;
+        }
+        let in_region = h.regions[..h.region_count]
+            .iter()
+            .any(|&(s, e)| addr >= s && addr + size <= e);
+        if !in_region {
+            out.error = Some("block lies outside every donated region");
+            return out;
+        }
+
+        last_end = addr + size;
+        out.free_bytes += size;
+        out.blocks += 1;
+        if out.blocks > 1_000_000 {
+            out.error = Some("free list has a cycle");
+            return out;
+        }
+        cur = unsafe { (*cur).next };
+    }
+    out
 }

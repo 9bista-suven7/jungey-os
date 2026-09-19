@@ -150,17 +150,96 @@ thesis — get it wrong here and everything above inherits the mistake.*
 
 ---
 
-## Stage 3 — SMP, drivers, storage
+## Stage 3 — SMP, drivers, storage  🔶 *in progress*
 
-Secondary core bring-up (PSCI), per-CPU run queues, spinlocks and RCU-ish
-read paths, userspace driver framework with IRQ-as-message, a real block driver
-(virtio-blk, then UFS/eMMC), and a filesystem — most likely a log-structured one,
-because flash and because crash consistency for the agent's action log matters.
+Broken into four parts, each with its own exit test, because the whole stage is
+too big to land or verify at once.
 
-**Exit test:** four cores running, a file written through a userspace filesystem
-server survives a hard reset, and `fsck` finds nothing.
+### 3a — SMP  ✅ *done*
 
-*Cost: 3–5 months.*
+Secondary cores started through PSCI, per-CPU state on `TPIDR_EL1`, one global
+run queue with threads free to migrate, per-core GICv3 redistributors and
+generic timers, and a heap integrity checker.
+
+**Exit test:** every core runs work, threads migrate between cores, and a lock
+held across cores loses no updates. ✅
+
+```
+  cpu 1      : online (mpidr 0x1)
+  cpu 2      : online (mpidr 0x2)
+  cpu 3      : online (mpidr 0x3)
+  smp        : 4 of 4 cores online
+
+  8 threads on 4 cores, each taking one lock 20000 times
+  shared counter : 160000 of 160000 expected
+  lock           : PASS — no update lost under cross-core contention
+  contended on   : cores 0123
+
+  thread          state  slices  cores
+  w2           finished       5  0123
+  w6           finished       5  0123
+  receiver     finished       3  02        <- user processes migrate too
+
+  cpu   switches   timer ticks
+  0           21            89
+  1           15            89
+  2           18            89
+  3           18            88
+```
+
+25 consecutive clean runs on 4 cores, and it still works on `-smp 1`.
+
+**Two concurrency bugs, both found by running it, not by reading it:**
+
+- *A thread was released before its context was saved.* `schedule` cleared
+  `on_cpu` under the lock and only then called `cpu_switch_to`. In that window
+  another core could pick the same thread up and restore a context that was
+  still being written — two cores running one thread on one stack. The symptom
+  was a wild pointer fault or a hang, in about 3 runs in 8. The fix is the one
+  Linux calls `finish_task_switch`: the thread stays claimed across the switch
+  and is released by whichever thread the core runs next, which is the first
+  moment the save is complete.
+- *`spawn` published a thread before `attach_process` bound it.* On one core a
+  newly spawned thread waits its turn; on four, another core runs it
+  immediately — with no pid and an empty TTBR0, so its syscalls returned
+  `EINVAL` and its next context switch unmapped its own code. Threads are now
+  created stopped and started explicitly, which is why `State::New` exists.
+
+Neither is visible on one core. Both are the whole reason this stage is
+sequenced before the driver work rather than after it.
+
+**Deviation:** *one global run queue, not per-CPU queues.* Per-CPU queues buy
+lock throughput this kernel has no way to measure a need for, and they cost the
+property that makes this version reviewable — that there is exactly one place a
+thread's state can change. Revisit when a profile says the scheduler lock is
+hot.
+
+### 3b — Block driver  ⬜
+
+virtio-blk in the kernel first: virtqueues, descriptor rings, DMA through the
+linear map, completion interrupts.
+
+**Exit test:** write a sector, read it back on a fresh boot from the same disk
+image.
+
+### 3c — Filesystem  ⬜
+
+A log-structured filesystem, because flash, and because crash consistency for
+the agent's action log is a stage 6 requirement that has to be designed in here.
+
+**Exit test:** a file written and then power-cut mid-write leaves the filesystem
+mountable, with either the old contents or the new, never a mix.
+
+### 3d — Userspace drivers  ⬜
+
+The driver framework: MMIO regions and IRQs as capabilities, so a driver is an
+ordinary process holding a `Device` capability. Move virtio-blk out of the
+kernel to prove the framework carries a real driver.
+
+**Exit test:** a file written through a userspace filesystem server survives a
+hard reset, and the kernel contains no block-device code.
+
+*Cost: 3–5 months for the stage. 3a took days.*
 
 ---
 

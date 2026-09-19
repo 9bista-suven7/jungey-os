@@ -12,6 +12,11 @@ Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and
 
 ## Status
 
+**Stage 3a — it runs on every core.** Secondary cores are started through PSCI,
+per-CPU state lives on `TPIDR_EL1`, and threads — kernel and user alike —
+migrate freely between cores off one run queue. Locks are genuinely contended
+now, and the kernel powers the machine off when its demos finish.
+
 **Stage 2 — it runs processes.** On top of stage 1's MMU, scheduler and GICv3,
 the kernel now loads ELF images into isolated address spaces, runs them at EL0,
 and serves them seven system calls. A process's entire authority is the
@@ -35,57 +40,64 @@ cd os
 
 Quit QEMU with `Ctrl-A` then `X`.
 
-Expected output (abridged — the boot banner and hardware discovery come first):
+Expected output (abridged — hardware discovery and the capability demo come
+first; see `docs/ROADMAP.md` for those):
 
 ```
-  Jungey OS  v0.3.0  ·  stage 2  ·  aarch64
+  cpus       : 4 in the device tree, psci via hvc
+  cpu 1      : online (mpidr 0x1)
+  cpu 2      : online (mpidr 0x2)
+  cpu 3      : online (mpidr 0x3)
+  smp        : 4 of 4 cores online
   ----------------------------------------------------------
-  mmu        : on, linear map at 0xffff000000000000
-  console    : pl011 at 0x0009000000 (from dtb)
-  paging     : ttbr0 live, 4 KiB pages, per-process asids
-  gic        : v3 at 0x0008000000/0x00080a0000, 288 interrupt lines
-  sched      : round-robin, thread 0 is 'boot'
-  timer      : cntv at 62500000 Hz, tick 100 Hz, intid 27
-  ----------------------------------------------------------
-  channel 0 created; root capability #1 (send+recv)
-  derived #2 (send) and #3 (recv) from #1
-
   [receiver] pid 0 wrote its pid to 0x0000000000402000, reads back 0
-  [receiver] blocking on my RECV capability
   [sender  ] pid 1 wrote its pid to 0x0000000000402000, reads back 1
-  [sender  ] sending on my SEND capability
   [sender  ] send ok
-  [sender  ] now trying to RECEIVE on the same capability
   [sender  ] refused, as it should be: EPERM (capability lacks the right)
   [receiver] got: "hello from the sender"
-  [intruder] holding no capability; trying slot 0 anyway
   [intruder] denied: EBADCAP (no such capability)
-  [trespass] reading a kernel address from EL0
 
-  !! pid Some(3) fault: data abort, lower EL at elr 0x4002a8, far 0xffff000040080000
+  !! pid Some(3) fault: data abort, lower EL at far 0xffff000040080000
   !! esr 0x000000009200000d — terminating the process
 
   [kernel  ] revoking root capability #1
   [kernel  ] 2 derived capabilities died with it
-
-  [receiver] retrying the receive with the same capability
   [receiver] dead: EREVOKED (capability was revoked)
-  [sender  ] retrying the send with the same capability
   [sender  ] dead: EREVOKED (capability was revoked)
-
-  process        pid  exit  capability
-  receiver        0     0  #3 recv REVOKED
-  sender          1     0  #2 send REVOKED
-  intruder        2     0  none
-  trespasser      3    -1  none
-
-  channel 0  : 1 sent, 1 received, 0 queued
-  irqs       : 0 spurious, 0 unclaimed
+  heap check after stage 2 : ok — 3 free blocks, 1044352 bytes free
   ----------------------------------------------------------
-  stage 2 complete. handing the core to idle.
+  8 threads on 4 cores, each taking one lock 20000 times
+
+  shared counter : 160000 of 160000 expected
+  lock           : PASS — no update lost under cross-core contention
+  contended on   : cores 0123
+  elapsed        : 9 ticks (90 ms)
+
+  thread          state  slices  cores
+  boot         runnable      17  0123
+  idle0        runnable       3  0
+  ...
+  receiver     finished       3  02
+  w2           finished       5  0123
+  w6           finished       5  0123
+
+  cpu   switches   timer ticks
+  0           21            89
+  1           15            89
+  2           18            89
+  3           18            88
+
+  idle wakeups   : 298
+  irqs           : 0 spurious, 0 unclaimed
+  heap check after stage 3 : ok — 4 free blocks, 1042432 bytes free
+  ----------------------------------------------------------
+  stage 3a complete.
+  powering off via psci.
 ```
 
-Read that output as five separate claims, each of which fails loudly if broken:
+Read that output as a set of claims, each of which fails loudly if broken:
+
+**Capabilities (stage 2)**
 
 - **Authority is only what you hold.** The message crosses only because each
   side was handed a capability.
@@ -95,9 +107,22 @@ Read that output as five separate claims, each of which fails loudly if broken:
   back their own pid.
 - **Revocation cuts the subtree.** One call at the root; both derived
   capabilities die; neither process was notified, they just find out.
+- The trespasser reads a kernel address from EL0, is killed for it, and nothing
+  else notices.
 
-The trespasser reads a kernel address from EL0, is killed for it, and nothing
-else notices.
+**Multiprocessing (stage 3a)**
+
+- **Every core does work.** The switch and tick counts per CPU are within one
+  of each other.
+- **Threads are not pinned.** The `cores` column shows each worker running on
+  several cores, user processes included.
+- **Locks hold under real concurrency.** 160,000 increments from 8 threads on
+  4 cores, none lost. A broken lock reports the exact shortfall.
+- **The heap is intact.** Checked between stages, because corruption surfaces
+  as a fault somewhere else entirely, thousands of instructions later.
+
+The kernel powers off through PSCI when it finishes, so `./run.sh` returns
+rather than idling forever.
 
 Other invocations:
 
@@ -148,7 +173,8 @@ os/
         ├── exceptions.rs     VBAR_EL1 setup, ESR and fault-status decoding
         ├── irq.rs            interrupt dispatch
         ├── gic.rs            GICv3 distributor, redistributor, CPU interface
-        ├── time.rs           generic timer, 100 Hz scheduler tick
+        ├── time.rs           generic timer, per-core 100 Hz tick
+        ├── smp.rs            PSCI bring-up, per-CPU state on TPIDR_EL1
         ├── dtb.rs            flattened device tree reader
         ├── cap.rs            capabilities: minting, derivation, revocation
         ├── ipc.rs            channels and message queues
@@ -161,7 +187,7 @@ os/
         └── mm/
             ├── mod.rs        page constants, PHYS_OFFSET, phys<->virt
             ├── frames.rs     physical frame allocator with reservations
-            ├── heap.rs       first-fit kernel heap behind GlobalAlloc
+            ├── heap.rs       first-fit kernel heap, with an integrity checker
             ├── paging.rs     page tables, address spaces, permissions
             └── uaccess.rs    copying across the user/kernel boundary
 ```
@@ -207,3 +233,10 @@ the higher half.
   which is the worst way to find out.
 - **The kernel never dereferences a user pointer.** Every access goes through
   `uaccess`, which translates via that process's own page tables first.
+- **A thread stays claimed across a context switch.** It is released by the
+  thread the core runs next, once `cpu_switch_to` has actually saved its
+  context. Releasing it any earlier lets another core restore a context that is
+  still being written.
+- **A thread is created stopped and started explicitly.** On four cores, a
+  thread that is visible is a thread that is already running — before whatever
+  was going to be attached to it has been.

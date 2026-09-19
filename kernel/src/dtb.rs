@@ -92,7 +92,7 @@ impl Fdt {
                     return Some(value)
                 }
                 // Past the root's own properties once we descend.
-                Event::BeginNode { depth } if depth == 2 => return None,
+                Event::BeginNode { depth, .. } if depth == 2 => return None,
                 _ => {}
             }
         }
@@ -161,6 +161,63 @@ impl Fdt {
         0
     }
 
+    /// The value of `prop` on the first node advertising `compatible`.
+    pub fn prop_of(&self, compatible: &str, prop: &str) -> Option<&'static [u8]> {
+        let mut w = Walker::new(self);
+        let mut cur_compat: Option<&'static [u8]> = None;
+        let mut cur_val: Option<&'static [u8]> = None;
+        while let Some(ev) = w.next_event() {
+            match ev {
+                Event::BeginNode { .. } => {
+                    cur_compat = None;
+                    cur_val = None;
+                }
+                Event::Prop { name, value, .. } => {
+                    if name == "compatible" {
+                        cur_compat = Some(value);
+                    } else if name == prop {
+                        cur_val = Some(value);
+                    }
+                    if let (Some(c), Some(v)) = (cur_compat, cur_val) {
+                        if compat_matches(c, compatible) {
+                            return Some(v);
+                        }
+                    }
+                }
+                Event::EndNode => {}
+            }
+        }
+        None
+    }
+
+    /// MPIDR values of every CPU the firmware describes, from `/cpus`.
+    ///
+    /// The kernel does not assume core 0 is the only one, nor that affinities
+    /// are dense: on a big.LITTLE part they are neither.
+    pub fn cpus(&self, out: &mut [u64]) -> usize {
+        let mut w = Walker::new(self);
+        let mut in_cpus = false;
+        let mut cells = 1usize; // /cpus/#address-cells, 1 on most arm64 boards
+        let mut n = 0;
+
+        while let Some(ev) = w.next_event() {
+            match ev {
+                Event::BeginNode { depth: 2, name } => in_cpus = name == "cpus",
+                Event::Prop { depth: 2, name: "#address-cells", value } if in_cpus && value.len() >= 4 => {
+                    cells = be32_slice(value) as usize;
+                }
+                Event::Prop { depth: 3, name: "reg", value } if in_cpus => {
+                    if n < out.len() && value.len() >= cells * 4 {
+                        out[n] = MemoryRegions::read_cells(value, 0, cells);
+                        n += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        n
+    }
+
     /// Every `(base, size)` pair from every `/memory` node.
     pub fn memory_regions(&self) -> MemoryRegions<'_> {
         MemoryRegions {
@@ -175,6 +232,7 @@ impl Fdt {
 enum Event {
     BeginNode {
         depth: usize,
+        name: &'static str,
     },
     EndNode,
     Prop {
@@ -215,7 +273,7 @@ impl<'a> Walker<'a> {
                     self.pos += align4(n);
                     self.depth += 1;
                     self.node = name;
-                    return Some(Event::BeginNode { depth: self.depth });
+                    return Some(Event::BeginNode { depth: self.depth, name });
                 }
                 FDT_END_NODE => {
                     self.depth = self.depth.saturating_sub(1);

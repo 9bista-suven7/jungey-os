@@ -34,6 +34,7 @@ cpu_switch_to:
 // Context::new planted there.
 .global thread_trampoline
 thread_trampoline:
+    bl      finish_switch               // release the thread we were switched in over
     msr     daifclr, #3                 // a new thread runs with IRQs enabled
     mov     x0, x20
     blr     x19

@@ -25,6 +25,7 @@ pub mod irq;
 pub mod mm;
 pub mod proc;
 pub mod sched;
+pub mod smp;
 pub mod syscall;
 pub mod sync;
 pub mod time;
@@ -66,7 +67,7 @@ const RULE: &str = "  ----------------------------------------------------------
 #[no_mangle]
 pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
     println!("{}", BANNER);
-    println!("  Jungey OS  v0.3.0  ·  stage 2  ·  aarch64");
+    println!("  Jungey OS  v0.4.0  ·  stage 3  ·  aarch64");
     println!("{}", RULE);
 
     let (kstart, kend) = unsafe {
@@ -132,6 +133,17 @@ pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
     mm::paging::init().expect("paging init");
     println!("  paging     : ttbr0 live, 4 KiB pages, per-process asids");
 
+    // ---- cpu discovery, before anything that reads per-cpu state ----
+    let mut mpidrs = [0u64; smp::MAX_CPUS];
+    let ncpus = fdt.cpus(&mut mpidrs);
+    let psci_method = fdt.prop_of("arm,psci-0.2", "method").unwrap_or(b"");
+    smp::init_boot_cpu(psci_method, ncpus);
+    println!(
+        "  cpus       : {} in the device tree, psci via {}",
+        ncpus,
+        smp::psci_method_name()
+    );
+
     // ---- interrupt controller ----
     let mut gic_regs = [(0u64, 0u64); 2];
     if fdt.node_regs("arm,gic-v3", &mut gic_regs) < 2 {
@@ -153,13 +165,31 @@ pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
 
     unsafe { core::arch::asm!("msr daifclr, #3") }; // interrupts live from here
     println!("  irq        : unmasked");
+
+    // ---- secondary cores ----
+    for i in 1..ncpus.min(smp::MAX_CPUS) {
+        match smp::start_cpu(i, mpidrs[i]) {
+            Ok(()) => println!("  cpu {}      : online (mpidr {:#x})", i, mpidrs[i]),
+            Err(e) => println!("  cpu {}      : FAILED — {}", i, e),
+        }
+    }
+    println!("  smp        : {} of {} cores online", smp::online_count(), ncpus);
     println!("{}", RULE);
 
     stage2_demo();
+    heap_check("after stage 2");
+    println!("{}", RULE);
+    stage3_demo();
+    heap_check("after stage 3");
 
     println!("{}", RULE);
-    println!("  stage 2 complete. handing the core to idle.");
-    halt()
+    println!("  stage 3a complete.");
+
+    // The demos are the kernel's whole job right now, so stopping the machine
+    // when they finish beats idling forever: `./run.sh` returns, and a stress
+    // loop is bounded by the work rather than by a timeout.
+    println!("  powering off via psci.");
+    smp::system_off()
 }
 
 // ---------------------------------------------------------------------------
@@ -187,9 +217,13 @@ fn start_process(name: &'static str, role: usize, cap: Option<cap::Cap>) -> usiz
     if let Some(c) = cap {
         proc::install_cap(pid, 0, c).expect("install capability");
     }
-    let tid = sched::spawn(name, user_thread, pid).expect("spawn user thread");
+    // Stopped, then attached, then started: on four cores a thread that is
+    // visible is a thread that is running, and one started before its address
+    // space was attached would be scheduled with an empty TTBR0.
+    let tid = sched::spawn_stopped(name, user_thread, pid).expect("spawn user thread");
     let ttbr0 = unsafe { (*proc::get(pid).unwrap()).space.ttbr0() };
     sched::attach_process(tid, pid, ttbr0);
+    sched::start(tid);
     pid
 }
 
@@ -266,6 +300,124 @@ fn report() {
         let p = 0usize as *const u64;
         let v = unsafe { core::ptr::read_volatile(p) };
         println!("  fault-demo : UNREACHABLE, read {:#x}", v);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3a exit test: every core runs work, threads migrate between cores, and
+// a lock held across cores actually serialises.
+// ---------------------------------------------------------------------------
+
+/// Worker threads for the SMP test — more than there are cores, so the run
+/// queue has to hand work around rather than pinning one thread per core.
+const SMP_WORKERS: usize = 8;
+/// Increments each worker makes to the shared counter. The final total is the
+/// only thing that distinguishes a working lock from a broken one.
+const INCREMENTS: u64 = 20_000;
+
+/// The contended resource. If the spinlock is wrong under real concurrency,
+/// this ends up less than SMP_WORKERS * INCREMENTS and the test says so.
+static SHARED: sync::SpinLock<u64> = sync::SpinLock::new(0);
+
+/// Per-worker record of which cores touched the counter, so a lost update can
+/// be attributed rather than just noticed.
+static CONTENDED_ON: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+const WORKER_NAMES: [&str; SMP_WORKERS] =
+    ["w0", "w1", "w2", "w3", "w4", "w5", "w6", "w7"];
+
+fn smp_worker(id: usize) {
+    for _ in 0..INCREMENTS {
+        let mut g = SHARED.lock();
+        *g += 1;
+        CONTENDED_ON.fetch_or(1 << smp::cpu_id(), core::sync::atomic::Ordering::Relaxed);
+        drop(g);
+    }
+    let _ = id;
+}
+
+/// Render a core bitmask as "0123", so a glance shows migration.
+fn cores_str(mask: u64, buf: &mut [u8; 8]) -> &str {
+    let mut n = 0;
+    for c in 0..smp::MAX_CPUS {
+        if mask & (1 << c) != 0 {
+            buf[n] = b'0' + c as u8;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return "-";
+    }
+    core::str::from_utf8(&buf[..n]).unwrap_or("?")
+}
+
+fn stage3_demo() {
+    println!(
+        "  {} threads on {} cores, each taking one lock {} times",
+        SMP_WORKERS,
+        smp::online_count(),
+        INCREMENTS
+    );
+
+    let started = time::ticks();
+    for name in WORKER_NAMES.iter() {
+        sched::spawn(name, smp_worker, 0).expect("spawn smp worker");
+    }
+    while sched::live_count() > 1 {
+        sched::yield_now();
+    }
+    let elapsed = time::ticks() - started;
+
+    let total = *SHARED.lock();
+    let expected = SMP_WORKERS as u64 * INCREMENTS;
+    println!();
+    println!("  shared counter : {} of {} expected", total, expected);
+    if total == expected {
+        println!("  lock           : PASS — no update lost under cross-core contention");
+    } else {
+        println!("  lock           : FAIL — {} updates lost", expected - total);
+    }
+    let mut buf = [0u8; 8];
+    println!(
+        "  contended on   : cores {}",
+        cores_str(CONTENDED_ON.load(core::sync::atomic::Ordering::Relaxed), &mut buf)
+    );
+    println!("  elapsed        : {} ticks ({} ms)", elapsed, elapsed * 1000 / time::HZ);
+
+    println!();
+    println!("  thread          state  slices  cores");
+    sched::for_each(|t| {
+        let mut b = [0u8; 8];
+        println!(
+            "  {:<12} {:>8}  {:>6}  {}",
+            t.name,
+            t.state.label(),
+            t.slices,
+            cores_str(t.cpus_seen, &mut b)
+        );
+    });
+
+    println!();
+    println!("  cpu   switches   timer ticks");
+    smp::for_each(|c| println!("  {:<3}   {:>8}   {:>11}", c.id, c.switches, c.ticks));
+    println!();
+    println!("  idle wakeups   : {}", sched::idle_wakeups());
+    let (spurious, unclaimed) = irq::stats();
+    println!("  irqs           : {} spurious, {} unclaimed", spurious, unclaimed);
+}
+
+/// Report the state of the kernel heap's free list.
+fn heap_check(when: &str) {
+    let c = mm::heap::check();
+    match c.error {
+        None => println!(
+            "  heap check {} : ok — {} free blocks, {} bytes free",
+            when, c.blocks, c.free_bytes
+        ),
+        Some(e) => println!(
+            "  heap check {} : CORRUPT — {} at {:#x}, after {} blocks",
+            when, e, c.at, c.blocks
+        ),
     }
 }
 

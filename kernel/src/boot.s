@@ -83,7 +83,7 @@ _entry:
 .Lbss_done:
 
     bl      .Lbuild_tables
-    bl      .Lenable_mmu
+    bl      __enable_mmu
 
     // ---- leave the identity map behind ----
     ldr     x0, =_high_entry            // link-time absolute: the high VA
@@ -141,7 +141,8 @@ _entry:
 
     ret
 
-.Lenable_mmu:
+.global __enable_mmu
+__enable_mmu:
     // MAIR: attr0 = Device-nGnRnE (0x00), attr1 = Normal WB RA/WA (0xFF)
     mov     x0, #0xff00
     msr     mair_el1, x0
@@ -208,3 +209,61 @@ __l0_table:
     .space 4096
 __l1_table:
     .space 4096
+
+// ---------------------------------------------------------------------------
+// Secondary core entry.
+//
+// PSCI CPU_ON brings a core up here, at a physical address, with the MMU off
+// and x0 holding the context id we passed — the physical address of that
+// core's boot descriptor: a stack top followed by a cpu id.
+//
+// The page tables already exist; a secondary only installs them.
+// ---------------------------------------------------------------------------
+.section ".text.boot", "ax"
+.global _secondary_start
+_secondary_start:
+    mov     x19, x0                     // boot descriptor, physical
+    ldr     x1, [x19]                   // stack_top, physical
+    mov     sp, x1
+
+    mrs     x2, CurrentEL
+    lsr     x2, x2, #2
+    cmp     x2, #2
+    b.ne    .Lsec_el1
+
+    mrs     x2, cnthctl_el2
+    orr     x2, x2, #3
+    msr     cnthctl_el2, x2
+    msr     cntvoff_el2, xzr
+    mov     x2, #(1 << 31)
+    msr     hcr_el2, x2
+    mov     x2, #0x0800
+    movk    x2, #0x30d0, lsl #16
+    msr     sctlr_el1, x2
+    mov     x2, #0x3c5
+    msr     spsr_el2, x2
+    adr     x2, .Lsec_el1
+    msr     elr_el2, x2
+    eret
+
+.Lsec_el1:
+    adrp    x1, __stack_top             // re-establish sp after the drop
+    ldr     x1, [x19]
+    mov     sp, x1
+
+    bl      __enable_mmu
+
+    ldr     x0, =_secondary_high
+    br      x0
+
+.section ".text", "ax"
+_secondary_high:
+    movz    x2, #0xffff, lsl #48        // PHYS_OFFSET
+    ldr     x1, [x19]
+    add     x1, x1, x2                  // stack top, now by its virtual address
+    mov     sp, x1
+    add     x0, x19, x2                 // boot descriptor, virtual
+    bl      secondary_main
+.Lsec_halt:
+    wfe
+    b       .Lsec_halt

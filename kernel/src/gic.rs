@@ -44,8 +44,16 @@ const DEFAULT_PRIORITY: u8 = 0xA0;
 /// The `intid` returned by an acknowledge when there was nothing to take.
 pub const SPURIOUS: u32 = 1023;
 
+const GICR_TYPER: usize = 0x0008;
+const GICR_TYPER_LAST: u64 = 1 << 4;
+/// Redistributor frame stride: an RD frame plus an SGI frame, 64 KiB each.
+const GICR_STRIDE: usize = 0x2_0000;
+
 static GICD: AtomicUsize = AtomicUsize::new(0);
-static GICR: AtomicUsize = AtomicUsize::new(0);
+/// Base of the redistributor region, and this core's frame within it.
+static GICR_BASE: AtomicUsize = AtomicUsize::new(0);
+static GICR_PER_CPU: [AtomicUsize; crate::smp::MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; crate::smp::MAX_CPUS];
 
 #[inline]
 unsafe fn rd(base: usize, off: usize) -> u32 {
@@ -69,17 +77,80 @@ unsafe fn gicr_wait_rwp(gicr: usize) {
     }
 }
 
-/// Bring up the distributor, this core's redistributor, and the CPU interface.
+/// Find the redistributor frame belonging to `mpidr`.
+///
+/// Frames are laid out consecutively but not necessarily in MPIDR order, and on
+/// a big.LITTLE part the affinities are not dense — so this matches on the
+/// affinity GICR_TYPER reports rather than indexing by CPU number.
+fn find_redistributor(base: usize, mpidr: u64) -> Option<usize> {
+    let want = (((mpidr >> 32) & 0xff) << 24) | (mpidr & 0xff_ffff);
+    let mut frame = base;
+    loop {
+        let typer = unsafe { read_volatile((frame + GICR_TYPER) as *const u64) };
+        if typer >> 32 == want {
+            return Some(frame);
+        }
+        if typer & GICR_TYPER_LAST != 0 {
+            return None;
+        }
+        frame += GICR_STRIDE;
+    }
+}
+
+/// This core's redistributor frame.
+fn my_gicr() -> usize {
+    GICR_PER_CPU[crate::smp::cpu_id()].load(Ordering::Relaxed)
+}
+
+/// Wake this core's redistributor and open its CPU interface. Every core runs
+/// this; only CPU 0 also programs the distributor.
+fn init_this_cpu() {
+    let base = GICR_BASE.load(Ordering::Relaxed);
+    let gicr = find_redistributor(base, crate::smp::mpidr())
+        .expect("no redistributor frame for this core");
+    GICR_PER_CPU[crate::smp::cpu_id()].store(gicr, Ordering::Relaxed);
+
+    unsafe {
+        let waker = rd(gicr, GICR_WAKER) & !GICR_WAKER_PROCESSOR_SLEEP;
+        wr(gicr, GICR_WAKER, waker);
+        while rd(gicr, GICR_WAKER) & GICR_WAKER_CHILDREN_ASLEEP != 0 {
+            core::hint::spin_loop();
+        }
+
+        // SGIs and PPIs live in the redistributor, not the distributor, and
+        // each core has its own copy of them.
+        wr(gicr, GICR_ICENABLER0, 0xFFFF_FFFF);
+        wr(gicr, GICR_IGROUPR0, 0xFFFF_FFFF);
+        for i in 0..32usize {
+            write_volatile((gicr + GICR_IPRIORITYR + i) as *mut u8, DEFAULT_PRIORITY);
+        }
+        gicr_wait_rwp(gicr);
+
+        // CPU interface: system-register access, then let group 1 through.
+        let mut sre: u64;
+        core::arch::asm!("mrs {}, S3_0_C12_C12_5", out(reg) sre);          // ICC_SRE_EL1
+        core::arch::asm!("msr S3_0_C12_C12_5, {}", "isb", in(reg) sre | 1);
+        core::arch::asm!("msr S3_0_C4_C6_0, {}", in(reg) 0xF0u64);         // ICC_PMR_EL1
+        core::arch::asm!("msr S3_0_C12_C12_3, {}", in(reg) 0u64);          // ICC_BPR1_EL1
+        core::arch::asm!("msr S3_0_C12_C12_7, {}", "isb", in(reg) 1u64);   // ICC_IGRPEN1_EL1
+    }
+}
+
+/// Bring up this core's redistributor and CPU interface. Secondaries only.
+pub fn init_secondary() {
+    init_this_cpu();
+}
+
+/// Bring up the distributor, CPU 0's redistributor, and its CPU interface.
 ///
 /// `gicd_phys` / `gicr_phys` are the first two `reg` entries of the device
 /// tree's `arm,gic-v3` node.
 pub fn init(gicd_phys: usize, gicr_phys: usize) -> u32 {
     let gicd = phys_to_virt(gicd_phys);
-    let gicr = phys_to_virt(gicr_phys);
     GICD.store(gicd, Ordering::Relaxed);
-    GICR.store(gicr, Ordering::Relaxed);
+    GICR_BASE.store(phys_to_virt(gicr_phys), Ordering::Relaxed);
 
-    unsafe {
+    let lines = unsafe {
         // How many SPIs this distributor implements: TYPER.ITLinesNumber.
         let lines = (((rd(gicd, GICD_TYPER) & 0x1f) + 1) * 32) as usize;
 
@@ -103,36 +174,16 @@ pub fn init(gicd_phys: usize, gicr_phys: usize) -> u32 {
         wr(gicd, GICD_CTLR, GICD_CTLR_ARE_NS | GICD_CTLR_EN_GRP1NS);
         gicd_wait_rwp(gicd);
 
-        // Wake this core's redistributor.
-        let waker = rd(gicr, GICR_WAKER) & !GICR_WAKER_PROCESSOR_SLEEP;
-        wr(gicr, GICR_WAKER, waker);
-        while rd(gicr, GICR_WAKER) & GICR_WAKER_CHILDREN_ASLEEP != 0 {
-            core::hint::spin_loop();
-        }
-
-        // SGIs and PPIs live in the redistributor, not the distributor.
-        wr(gicr, GICR_ICENABLER0, 0xFFFF_FFFF);
-        wr(gicr, GICR_IGROUPR0, 0xFFFF_FFFF);
-        for i in 0..32usize {
-            write_volatile((gicr + GICR_IPRIORITYR + i) as *mut u8, DEFAULT_PRIORITY);
-        }
-        gicr_wait_rwp(gicr);
-
-        // CPU interface: system-register access, then let group 1 through.
-        let mut sre: u64;
-        core::arch::asm!("mrs {}, S3_0_C12_C12_5", out(reg) sre);          // ICC_SRE_EL1
-        core::arch::asm!("msr S3_0_C12_C12_5, {}", "isb", in(reg) sre | 1);
-        core::arch::asm!("msr S3_0_C4_C6_0, {}", in(reg) 0xF0u64);         // ICC_PMR_EL1
-        core::arch::asm!("msr S3_0_C12_C12_3, {}", in(reg) 0u64);          // ICC_BPR1_EL1
-        core::arch::asm!("msr S3_0_C12_C12_7, {}", "isb", in(reg) 1u64);   // ICC_IGRPEN1_EL1
-
         lines as u32
-    }
+    };
+
+    init_this_cpu();
+    lines
 }
 
 /// Enable a per-core interrupt (SGI 0-15, PPI 16-31) on this core.
 pub fn enable_ppi(intid: u32) {
-    let gicr = GICR.load(Ordering::Relaxed);
+    let gicr = my_gicr();
     unsafe {
         wr(gicr, GICR_ISENABLER0, 1 << (intid & 31));
         gicr_wait_rwp(gicr);

@@ -61,6 +61,74 @@ pub fn wait_until(t: usize) {
     }
 }
 
+/// A line assembled in the process's own memory and written in one syscall.
+///
+/// Four cores run four processes now, and the kernel console lock is taken per
+/// `write`, not per line — so a process that emits a line in six calls gets its
+/// output shredded by the others. Buffering is not cosmetic here: it is what
+/// makes concurrent output readable at all.
+pub struct Line {
+    buf: [u8; 256],
+    len: usize,
+}
+
+impl Line {
+    pub const fn new() -> Self {
+        Line { buf: [0; 256], len: 0 }
+    }
+
+    fn raw(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            if self.len < self.buf.len() {
+                self.buf[self.len] = b;
+                self.len += 1;
+            }
+        }
+    }
+
+    /// Append a string.
+    pub fn s(&mut self, text: &str) -> &mut Self {
+        self.raw(text.as_bytes());
+        self
+    }
+
+    /// Append an unsigned decimal.
+    pub fn d(&mut self, mut n: usize) -> &mut Self {
+        let mut tmp = [0u8; 20];
+        let mut i = tmp.len();
+        loop {
+            i -= 1;
+            tmp[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        self.raw(&tmp[i..]);
+        self
+    }
+
+    /// Append a 64-bit hex value.
+    pub fn x(&mut self, n: usize) -> &mut Self {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut tmp = [0u8; 18];
+        tmp[0] = b'0';
+        tmp[1] = b'x';
+        for i in 0..16 {
+            tmp[2 + i] = DIGITS[(n >> (60 - i * 4)) & 0xf];
+        }
+        self.raw(&tmp);
+        self
+    }
+
+    /// Terminate the line and emit it as a single write.
+    pub fn nl(&mut self) {
+        self.raw(b"\n");
+        write(unsafe { core::str::from_utf8_unchecked(&self.buf[..self.len]) });
+        self.len = 0;
+    }
+}
+
 /// Minimal unsigned decimal output: there is no formatter down here.
 pub fn write_dec(mut n: usize) {
     let mut buf = [0u8; 20];
