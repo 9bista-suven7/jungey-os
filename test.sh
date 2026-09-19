@@ -9,6 +9,11 @@
 set -uo pipefail
 
 cd "$(dirname "$0")"
+
+# Fail with something useful if the toolchain is missing.
+# shellcheck source=tools/preflight.sh
+. "$(dirname "$0")/tools/preflight.sh"
+preflight yes
 LOG_DIR="$(mktemp -d)"
 trap 'rm -rf "$LOG_DIR"' EXIT
 

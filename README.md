@@ -63,8 +63,27 @@ Revoking a capability kills everything derived from it, wherever it ended up.
 
 ## Run it
 
-Requirements: a Rust toolchain and `qemu-system-aarch64`. The kernel's build
-script builds `os/user` and embeds the result, so one command builds both.
+### Setting up
+
+Two things: a Rust toolchain and QEMU. The scripts check for both and tell you
+what to run if either is missing.
+
+```bash
+# Rust, from rustup rather than your distribution: the kernel needs 1.82 or
+# newer and distribution packages are usually older.
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+. "$HOME/.cargo/env"
+rustup target add aarch64-unknown-none-softfloat
+rustup component add llvm-tools
+
+# QEMU: the machine this runs on.
+sudo apt install qemu-system-arm     # Debian/Ubuntu
+# sudo dnf install qemu-system-aarch64   # Fedora
+# brew install qemu                      # macOS
+```
+
+The kernel's build script builds `user/` and embeds the result, so one command
+builds both.
 
 ```bash
 rustup target add aarch64-unknown-none-softfloat

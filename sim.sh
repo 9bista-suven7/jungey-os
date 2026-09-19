@@ -13,6 +13,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# Fail with something useful if the toolchain is missing.
+# shellcheck source=tools/preflight.sh
+. "$(dirname "$0")/tools/preflight.sh"
+preflight yes
+
 GUI=0
 SHOTS=3
 OUT="screenshots"
