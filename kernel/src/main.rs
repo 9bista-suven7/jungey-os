@@ -74,7 +74,7 @@ const RULE: &str = "  ----------------------------------------------------------
 #[no_mangle]
 pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
     println!("{}", BANNER);
-    println!("  Jungey OS  v0.10.0  ·  stage 5c  ·  aarch64");
+    println!("  Jungey OS  v0.11.0  ·  stage 5d  ·  aarch64");
     println!("{}", RULE);
 
     let (kstart, kend) = unsafe {
@@ -210,6 +210,9 @@ pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
     println!("{}", RULE);
     stage5c_demo();
     heap_check("after stage 5c");
+    println!("{}", RULE);
+    stage5d_demo();
+    heap_check("after stage 5d");
 
     // A screen, if the machine has one. `sim.sh` attaches a display; `run.sh`
     // does not, and everything above works identically either way.
@@ -227,7 +230,7 @@ pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
             blk::stale_replies()
         );
     }
-    println!("  stage 5c complete.");
+    println!("  stage 5d complete.");
 
     // The demos are the kernel's whole job right now, so stopping the machine
     // when they finish beats idling forever: `./run.sh` returns, and a stress
@@ -1493,6 +1496,173 @@ fn stage5c_demo() {
         println!(
             "  RESULT     : FAIL — wrong {}, evictions {}, restores {}, prefix-before {}, prefix-after {}, resident {}",
             wrong, evictions, restores, before, prefix_evictions, resident
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 5d exit test: opportunistic work is admitted only when there is
+// headroom for it, and an energy cap binds.
+//
+// A phone has no fan. Sustained accelerator work heats the package until
+// something gives, and today what gives is the whole device — the governor
+// notices late and throttles everything, the thing the user is waiting for
+// included. Making temperature an input to *admission* means the work that
+// yields is chosen rather than whatever happened to be running.
+// ---------------------------------------------------------------------------
+
+fn degrees(milli_c: u64) -> alloc::string::String {
+    alloc::format!("{}.{}C", milli_c / 1000, (milli_c % 1000) / 100)
+}
+
+fn try_submit(what: &str, qos: tensor::Qos, segments: u32, budget: Option<u64>) -> Option<u64> {
+    match tensor::submit_with_budget(usize::MAX, qos, segments, None, budget) {
+        Ok(id) => {
+            println!("    {:<22} admitted as job {}", what, id);
+            Some(id)
+        }
+        Err(tensor::Reject::NoHeadroom { temp_milli_c, limit_milli_c }) => {
+            println!(
+                "    {:<22} REFUSED — device at {} above ambient, limit for this class {}",
+                what,
+                degrees(temp_milli_c),
+                degrees(limit_milli_c)
+            );
+            None
+        }
+        Err(tensor::Reject::Undeliverable { .. }) => {
+            println!("    {:<22} REFUSED — deadline", what);
+            None
+        }
+    }
+}
+
+fn wait_for_idle(what: &str) {
+    wait_until(
+        || {
+            let mut busy = false;
+            tensor::for_each(|j| {
+                if matches!(j.state, tensor::JobState::Queued | tensor::JobState::Running) {
+                    busy = true;
+                }
+            });
+            !busy
+        },
+        what,
+    );
+}
+
+fn stage5d_demo() {
+    println!(
+        "  thermal    : {} above ambient, throttle at {}, critical at {}",
+        degrees(tensor::temperature()),
+        degrees(tensor::throttle_point()),
+        degrees(tensor::critical_point())
+    );
+    println!();
+
+    // ---- cool: anything goes ----
+    println!("  cold device:");
+    let opp = try_submit("opportunistic work", tensor::Qos::Opportunistic, 4, None);
+    if opp.is_some() {
+        wait_for_idle("the opportunistic job to finish");
+    }
+
+    // ---- heat it up ----
+    println!();
+    println!("  heating    : 60 segments of background work");
+    if tensor::submit(usize::MAX, tensor::Qos::Background, 60, None).is_ok() {
+        wait_for_idle("the device to get hot");
+    }
+    let hot = tensor::temperature();
+    println!("    device now at {} above ambient (peak {})", degrees(hot), degrees(tensor::peak_temperature()));
+
+    // ---- warm: classes diverge ----
+    //
+    // The interesting band. Nothing the user is waiting for is affected; the
+    // work nobody is waiting for is what gives way.
+    println!();
+    println!("  warm device (past the throttle point, short of critical):");
+    let refused_hot = try_submit("opportunistic work", tensor::Qos::Opportunistic, 4, None).is_none();
+    let background_refused = try_submit("background work", tensor::Qos::Background, 4, None).is_none();
+    let interactive_ok = try_submit("interactive work", tensor::Qos::Interactive, 2, None).is_some();
+    wait_for_idle("the interactive job to finish");
+
+    // ---- critical: nothing new at all ----
+    println!();
+    println!("  heating    : another 60 segments, past the critical point");
+    if tensor::submit(usize::MAX, tensor::Qos::Background, 60, None).is_ok() {
+        wait_for_idle("the device to reach critical");
+    } else {
+        // Already too hot to admit background work; heat with interactive
+        // instead, which is still allowed below critical.
+        if tensor::submit(usize::MAX, tensor::Qos::Interactive, 60, None).is_ok() {
+            wait_for_idle("the device to reach critical");
+        }
+    }
+    println!("    device now at {} above ambient", degrees(tensor::temperature()));
+    println!("  critical device:");
+    let interactive_refused =
+        try_submit("interactive work", tensor::Qos::Interactive, 2, None).is_none();
+
+    // ---- let it cool ----
+    println!();
+    println!("  cooling    : idling until the device drops below the throttle point");
+    sched::sleep_ticks(80);
+    let cooled = tensor::temperature();
+    println!("    device now at {} above ambient", degrees(cooled));
+    let readmitted = try_submit("opportunistic work", tensor::Qos::Opportunistic, 4, None).is_some();
+    if readmitted {
+        wait_for_idle("the re-admitted job to finish");
+    }
+
+    // ---- an energy cap that binds ----
+    //
+    // A cap is not a refusal: "do as much as this buys" is a reasonable thing
+    // for background work to ask, and the job stops when it has spent it.
+    println!();
+    let cap_uj = 4_000;
+    println!("  energy cap : 40 segments of background work, capped at {} uJ", cap_uj);
+    let capped = tensor::submit_with_budget(
+        usize::MAX,
+        tensor::Qos::Background,
+        40,
+        None,
+        Some(cap_uj),
+    )
+    .ok();
+    if capped.is_some() {
+        wait_for_idle("the capped job to stop");
+    }
+    let mut capped_stats = (0u32, 0u32, 0u64);
+    if let Some(id) = capped {
+        if let Some(st) = tensor::stat(id) {
+            capped_stats = (st.2, st.3, st.8);
+        }
+    }
+    println!(
+        "    stopped after {} of {} segments, having spent {} uJ of {}",
+        capped_stats.1, capped_stats.0, capped_stats.2, cap_uj
+    );
+
+    // ---- report ----
+    let (segments, refused, _) = tensor::totals();
+    println!();
+    println!("  device     : {} segments, {} refusals, peak {} above ambient",
+        segments, refused, degrees(tensor::peak_temperature()));
+    println!("  energy     : {} mJ modelled across every job", tensor::total_energy_uj() / 1000);
+
+    println!();
+    let cap_bound = capped_stats.1 > 0 && capped_stats.1 < capped_stats.0;
+    if refused_hot && background_refused && interactive_ok && interactive_refused && readmitted && cap_bound {
+        println!("  RESULT     : PASS — past the throttle point the work nobody was waiting for was");
+        println!("               refused while interactive work still got through; past critical even");
+        println!("               that was refused; everything was admitted again once it cooled; and");
+        println!("               an energy cap stopped a job at its budget rather than at its end");
+    } else {
+        println!(
+            "  RESULT     : FAIL — warm: opp {} bg {} ui {} | critical: ui-refused {} | readmitted {} | cap {}",
+            refused_hot, background_refused, interactive_ok, interactive_refused, readmitted, cap_bound
         );
     }
 }

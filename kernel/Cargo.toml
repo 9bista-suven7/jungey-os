@@ -1,6 +1,6 @@
 [package]
 name    = "jungey-kernel"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 description = "Jungey OS microkernel (AArch64)"
 

@@ -415,7 +415,7 @@ have budgeted for.*
 
 ---
 
-## Stage 5 — The inference stack  🔶 *in progress* ← *the reason this project exists*
+## Stage 5 — The inference stack  ✅ *done* ← *the reason this project exists*
 
 Split the way stage 3 was, because the whole thing is too big to verify at once.
 
@@ -606,13 +606,60 @@ in the same form as `blk`.
 - *No compression.* Quantising a spilled KV block is the obvious next lever and
   is orthogonal to the tiering.
 
-### 5d — Energy budgets  ⬜
+### 5d — Energy budgets  ✅ *done*
 
-Joules per job and per class, thermal headroom as an admission input,
-`opportunistic` work as the elastic band.
+Temperature as an input to admission rather than a reason to throttle after the
+fact, and an energy cap a job can be held to.
 
 **Exit test:** opportunistic work is admitted only within budget and gives way
-when headroom disappears.
+when headroom disappears. ✅
+
+```
+  thermal    : 11.3C above ambient, throttle at 15.0C, critical at 45.0C
+
+  cold device:
+    opportunistic work     admitted as job 5
+
+  warm device (past the throttle point, short of critical):
+    opportunistic work     REFUSED — device at 33.0C above ambient, limit 15.0C
+    background work        REFUSED — device at 33.0C above ambient, limit 15.0C
+    interactive work       admitted as job 9
+
+  critical device:
+    interactive work       REFUSED — device at 54.1C above ambient, limit 45.0C
+
+  cooling    : idling until the device drops below the throttle point
+    opportunistic work     admitted as job 13
+
+  energy cap : 40 segments of background work, capped at 4000 uJ
+    stopped after 4 of 40 segments, having spent 4141 uJ of 4000
+```
+
+A phone has no fan. Sustained accelerator work heats the package until something
+gives, and on a conventional device what gives is *everything*: the governor
+notices late and throttles the whole SoC, including the thing the user is
+waiting for. Making temperature an admission input means the work that yields is
+**chosen**. Between the throttle point and critical — a deliberately wide band —
+the device still does everything that matters to whoever is holding it, and only
+the work nobody is waiting for is turned away.
+
+**An energy budget is a cap, not a promise.** "Do as much as four millijoules
+buys" is a reasonable thing for background work to ask, so a cap smaller than
+the work is admitted and binds later. A *deadline* is a request to be finished
+and can be answered honestly at submission, which is why that one is a refusal.
+The cap overshoots by one segment — it stops once spent, and segments are not
+divisible — and the report says so rather than rounding it away.
+
+**Deviations:**
+
+- *The thermal model is a single lumped temperature* that rises with work and
+  decays towards ambient. Real behaviour needs the part's own characterisation,
+  several sensors and a hysteresis policy. What is under test is what the
+  scheduler does with the number.
+- *Power is a fixed 2.5 W figure*, so energy is time in disguise. A real part
+  draws differently per operator and per clock.
+- *No per-app energy attribution over time* — joules land on jobs, not on the
+  application that keeps submitting them.
 
 *Cost: 6–12 months for the stage. The scheduler is the novel part; the kernels
 are a known quantity you can borrow from llama.cpp/MLC.*

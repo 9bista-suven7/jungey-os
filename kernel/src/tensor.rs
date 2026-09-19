@@ -77,13 +77,43 @@ const DEVICE_POWER_MW: u64 = 2500;
 /// Starting guess for segment cost, replaced by measurement after the first.
 const INITIAL_SEGMENT_US: u64 = 1000;
 
+// ---- thermal model -------------------------------------------------------
+//
+// A phone has no fan. Sustained accelerator work heats the package until
+// something has to give, and today what gives is the whole device: the governor
+// notices too late and throttles everything, including the thing the user is
+// waiting for. Here temperature is an *input to admission* instead, so the work
+// that gives way is chosen rather than whatever happened to be running.
+//
+// The model is deliberately crude — a single lumped temperature that rises with
+// work and decays towards ambient. Real thermal behaviour needs the part's own
+// characterisation. What is being tested is what the scheduler does with the
+// number, not the number.
+
+/// How much one segment heats the device, in thousandths of a degree.
+const RISE_PER_SEGMENT_MILLI_C: u64 = 400;
+/// How fast it cools when the device is idle, per millisecond.
+const DECAY_PER_MS_MILLI_C: u64 = 100;
+/// Above this, work nobody is waiting for is refused. Deliberately early: the
+/// point of having classes is that something yields long before the device is
+/// in trouble.
+const THROTTLE_MILLI_C: u64 = 15_000;
+/// Above this, nothing new is admitted at all — not even work the user is
+/// waiting on. A wide gap from the throttle point on purpose: between the two,
+/// the device is still doing everything that matters to whoever is holding it.
+const CRITICAL_MILLI_C: u64 = 45_000;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum JobState {
     Queued,
     Running,
     Done,
-    /// Refused at submission because its deadline could not be met.
+    /// Refused at submission: the deadline could not be met, the energy budget
+    /// could not cover the work, or there was no thermal headroom for it.
     Refused,
+    /// Stopped part way through because it ran out of the energy it asked for.
+    /// Not a failure — a budget doing its job.
+    OverBudget,
 }
 
 pub struct Job {
@@ -101,6 +131,10 @@ pub struct Job {
     pub preemptions: u64,
     /// Modelled energy, in microjoules.
     pub energy_uj: u64,
+    /// What it was allowed to spend, if it said.
+    pub energy_budget_uj: Option<u64>,
+    /// Why it was refused, for the report.
+    pub refusal: &'static str,
     /// Measured device time, in microseconds.
     pub device_us: u64,
 }
@@ -133,6 +167,7 @@ impl Job {
             JobState::Running => "running",
             JobState::Done => "done",
             JobState::Refused => "refused",
+            JobState::OverBudget => "overbudget",
         }
     }
 }
@@ -140,19 +175,26 @@ impl Job {
 struct Device {
     jobs: Vec<Job>,
     next_id: u64,
+    /// Degrees above ambient, in thousandths.
+    temp_milli_c: u64,
+    thermal_updated_us: u64,
     /// Running average of what a segment actually costs.
     us_per_segment: u64,
     /// The job the device ran last, for counting preemptions.
     last_run: Option<u64>,
     segments_run: u64,
+    peak_milli_c: u64,
 }
 
 static DEVICE: SpinLock<Device> = SpinLock::new(Device {
     jobs: Vec::new(),
     next_id: 1,
+    temp_milli_c: 0,
+    thermal_updated_us: 0,
     us_per_segment: INITIAL_SEGMENT_US,
     last_run: None,
     segments_run: 0,
+    peak_milli_c: 0,
 });
 
 static REFUSED: AtomicU64 = AtomicU64::new(0);
@@ -162,6 +204,36 @@ static PREEMPTIONS: AtomicU64 = AtomicU64::new(0);
 pub enum Reject {
     /// The work does not fit before the deadline, even at the front of the queue.
     Undeliverable { needed_us: u64, available_us: u64 },
+    /// The device is too hot for work of this class right now.
+    NoHeadroom { temp_milli_c: u64, limit_milli_c: u64 },
+}
+
+/// Apply cooling since the last update and return the current temperature.
+fn temperature_locked(dev: &mut Device) -> u64 {
+    let now = time::now_us();
+    if dev.thermal_updated_us == 0 {
+        dev.thermal_updated_us = now;
+        return dev.temp_milli_c;
+    }
+    let ms = now.saturating_sub(dev.thermal_updated_us) / 1000;
+    if ms > 0 {
+        dev.temp_milli_c = dev.temp_milli_c.saturating_sub(ms * DECAY_PER_MS_MILLI_C);
+        dev.thermal_updated_us = now;
+    }
+    dev.temp_milli_c
+}
+
+/// Degrees above ambient, in thousandths.
+pub fn temperature() -> u64 {
+    let mut dev = DEVICE.lock();
+    temperature_locked(&mut dev)
+}
+
+pub fn throttle_point() -> u64 {
+    THROTTLE_MILLI_C
+}
+pub fn critical_point() -> u64 {
+    CRITICAL_MILLI_C
 }
 
 /// Offer a job to the device.
@@ -176,11 +248,55 @@ pub fn submit(
     segments: u32,
     deadline_in_us: Option<u64>,
 ) -> Result<u64, Reject> {
+    submit_with_budget(owner, qos, segments, deadline_in_us, None)
+}
+
+/// Offer a job, saying what it may spend.
+///
+/// Two reasons to refuse, and both are better than accepting: the deadline
+/// cannot be met, or the device is too hot for work of this class. A caller
+/// told no can choose a smaller model, wait, or do without. A caller told yes
+/// and then throttled mid-run cannot do any of those things.
+///
+/// `energy_budget_uj` is a cap rather than a reason to refuse: the job runs
+/// until it has spent that much and then stops, which is what "do as much as
+/// this buys" means.
+pub fn submit_with_budget(
+    owner: usize,
+    qos: Qos,
+    segments: u32,
+    deadline_in_us: Option<u64>,
+    energy_budget_uj: Option<u64>,
+) -> Result<u64, Reject> {
     let now = time::now_us();
     let mut dev = DEVICE.lock();
 
     let cost = dev.us_per_segment;
     let needed_us = segments as u64 * cost;
+    let needed_uj = needed_us * DEVICE_POWER_MW / 1000;
+
+    // Thermal headroom. Interactive work is the user waiting, and is admitted
+    // until the device is genuinely in trouble; everything else yields first,
+    // which is the whole point of having classes.
+    let temp = temperature_locked(&mut dev);
+    let limit = match qos {
+        Qos::Interactive => CRITICAL_MILLI_C,
+        Qos::Foreground => CRITICAL_MILLI_C,
+        _ => THROTTLE_MILLI_C,
+    };
+    if temp >= limit {
+        REFUSED.fetch_add(1, Ordering::Relaxed);
+        record_refusal(&mut dev, owner, qos, segments, deadline_in_us, now, energy_budget_uj,
+                       "no thermal headroom");
+        return Err(Reject::NoHeadroom { temp_milli_c: temp, limit_milli_c: limit });
+    }
+
+    // An energy budget is a cap, not a promise. "Do as much as five millijoules
+    // buys" is a reasonable thing for background work to ask, so a cap smaller
+    // than the work is admitted and binds later rather than being refused —
+    // unlike a deadline, which is a request to be *finished* and can be
+    // answered honestly at submission.
+    let _ = needed_uj;
 
     if let Some(window) = deadline_in_us {
         // Work already queued that this job cannot push in front of.
@@ -195,22 +311,8 @@ pub fn submit(
 
         if needed_us + ahead > window {
             REFUSED.fetch_add(1, Ordering::Relaxed);
-            let id = dev.next_id;
-            dev.next_id += 1;
-            dev.jobs.push(Job {
-                id,
-                owner,
-                qos,
-                segments,
-                done_segments: 0,
-                deadline_us: Some(now + window),
-                submitted_us: now,
-                finished_us: 0,
-                state: JobState::Refused,
-                preemptions: 0,
-                energy_uj: 0,
-                device_us: 0,
-            });
+            record_refusal(&mut dev, owner, qos, segments, deadline_in_us, now,
+                           energy_budget_uj, "deadline cannot be met");
             return Err(Reject::Undeliverable {
                 needed_us: needed_us + ahead,
                 available_us: window,
@@ -232,9 +334,44 @@ pub fn submit(
         state: JobState::Queued,
         preemptions: 0,
         energy_uj: 0,
+        energy_budget_uj,
         device_us: 0,
+        refusal: "",
     });
     Ok(id)
+}
+
+/// Keep a record of work that was turned away. A refusal nobody can see is
+/// indistinguishable from work that silently never ran.
+#[allow(clippy::too_many_arguments)]
+fn record_refusal(
+    dev: &mut Device,
+    owner: usize,
+    qos: Qos,
+    segments: u32,
+    deadline_in_us: Option<u64>,
+    now: u64,
+    energy_budget_uj: Option<u64>,
+    why: &'static str,
+) {
+    let id = dev.next_id;
+    dev.next_id += 1;
+    dev.jobs.push(Job {
+        id,
+        owner,
+        qos,
+        segments,
+        done_segments: 0,
+        deadline_us: deadline_in_us.map(|w| now + w),
+        submitted_us: now,
+        finished_us: 0,
+        state: JobState::Refused,
+        preemptions: 0,
+        energy_uj: 0,
+        energy_budget_uj,
+        device_us: 0,
+        refusal: why,
+    });
 }
 
 /// Pick the next job: highest class first, and within a class the nearest
@@ -332,13 +469,29 @@ pub fn worker(_: usize) {
             // than the guess this started with.
             dev.us_per_segment = (cost * 3 + elapsed) / 4;
             dev.segments_run += 1;
+
+            // Work makes heat, and the cooling since the last segment is
+            // applied at the same time.
+            temperature_locked(&mut dev);
+            dev.temp_milli_c += RISE_PER_SEGMENT_MILLI_C;
+            if dev.temp_milli_c > dev.peak_milli_c {
+                dev.peak_milli_c = dev.temp_milli_c;
+            }
+
             let mut finished = None;
             if let Some(j) = dev.jobs.iter_mut().find(|j| j.id == id) {
                 j.done_segments += 1;
                 j.device_us += elapsed;
                 j.energy_uj += elapsed * DEVICE_POWER_MW / 1000;
+
+                // A budget that is not enforced is a comment.
+                let spent_out = matches!(j.energy_budget_uj, Some(b) if j.energy_uj >= b);
                 if j.done_segments >= j.segments {
                     j.state = JobState::Done;
+                    j.finished_us = time::now_us();
+                    finished = Some(j.id);
+                } else if spent_out {
+                    j.state = JobState::OverBudget;
                     j.finished_us = time::now_us();
                     finished = Some(j.id);
                 }
@@ -362,7 +515,7 @@ pub fn finished_or_prepare(id: u64, token: u64) -> Option<bool> {
     let j = dev.jobs.iter().find(|j| j.id == id)?;
     match j.state {
         JobState::Done => Some(true),
-        JobState::Refused => Some(false),
+        JobState::Refused | JobState::OverBudget => Some(false),
         _ => {
             sched::prepare_block(token);
             None
@@ -420,4 +573,14 @@ pub fn totals() -> (u64, u64, u64) {
         REFUSED.load(Ordering::Relaxed),
         PREEMPTIONS.load(Ordering::Relaxed),
     )
+}
+
+/// Hottest the device has been, in thousandths of a degree above ambient.
+pub fn peak_temperature() -> u64 {
+    DEVICE.lock().peak_milli_c
+}
+
+/// Total modelled energy across every job, in microjoules.
+pub fn total_energy_uj() -> u64 {
+    DEVICE.lock().jobs.iter().map(|j| j.energy_uj).sum()
 }

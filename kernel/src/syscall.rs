@@ -37,6 +37,8 @@ pub const EINVAL: isize = -5;
 pub const ETIMEDOUT: isize = -6;
 /// The work cannot be finished before the deadline it asked for.
 pub const EDEADLINE: isize = -7;
+/// The device is too hot for work of this class right now.
+pub const EHOT: isize = -9;
 
 /// Called from the synchronous-exception path when a lower EL executes SVC.
 pub fn dispatch(frame: &mut TrapFrame) {
@@ -351,6 +353,15 @@ fn sys_tensor_submit(pid: usize, qos: u64, segments: u32, deadline_us: u64) -> i
                 pid, needed_us, available_us
             );
             EDEADLINE
+        }
+        Err(tensor::Reject::NoHeadroom { temp_milli_c, limit_milli_c }) => {
+            crate::println!(
+                "  tensor     : refused pid {} — device at {}.{}C above ambient, limit for this class is {}.{}C",
+                pid,
+                temp_milli_c / 1000, (temp_milli_c % 1000) / 100,
+                limit_milli_c / 1000, (limit_milli_c % 1000) / 100
+            );
+            EHOT
         }
     }
 }
