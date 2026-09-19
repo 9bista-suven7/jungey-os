@@ -9,13 +9,20 @@
 // Each entry only has room for a register save and a branch, so the real work
 // happens in __exception_common.
 
-// Exception frame: x0-x30 at 0..247, then ELR_EL1 and SPSR_EL1.
+// Exception frame: x0-x30 at 0..247, then ELR_EL1, SPSR_EL1 and SP_EL0.
+//
 // ELR/SPSR must be in the frame, not left in the system registers: the
 // scheduler switches threads from inside the IRQ handler, and the thread we
 // switch to would otherwise clobber the return state of the one we left.
-.set FRAME_SIZE, 272
-.set FRAME_ELR,  256
-.set FRAME_SPSR, 264
+//
+// SP_EL0 for the same reason, and it is easier to miss: there is exactly one
+// SP_EL0 for the whole core. Preempt a user thread inside a syscall, return to
+// a different one, and it resumes on the *other* process's stack pointer —
+// which reads a stale return address and branches into nowhere.
+.set FRAME_SIZE,   288
+.set FRAME_ELR,    256
+.set FRAME_SPSR,   264
+.set FRAME_SP_EL0, 272
 
 .macro SAVE_REGS
     sub     sp, sp, #FRAME_SIZE
@@ -38,12 +45,16 @@
     mrs     x9,  elr_el1
     mrs     x10, spsr_el1
     stp     x9,  x10, [sp, #FRAME_ELR]
+    mrs     x9,  sp_el0
+    str     x9,       [sp, #FRAME_SP_EL0]
 .endm
 
 .macro RESTORE_REGS
     ldp     x9,  x10, [sp, #FRAME_ELR]
     msr     elr_el1,  x9
     msr     spsr_el1, x10
+    ldr     x9,       [sp, #FRAME_SP_EL0]
+    msr     sp_el0,   x9
     ldp     x0,  x1,  [sp, #16 * 0]
     ldp     x2,  x3,  [sp, #16 * 1]
     ldp     x4,  x5,  [sp, #16 * 2]

@@ -15,12 +15,17 @@ use core::panic::PanicInfo;
 
 #[macro_use]
 pub mod uart;
+pub mod cap;
 pub mod dtb;
+pub mod elf;
 pub mod exceptions;
 pub mod gic;
+pub mod ipc;
 pub mod irq;
 pub mod mm;
+pub mod proc;
 pub mod sched;
+pub mod syscall;
 pub mod sync;
 pub mod time;
 
@@ -39,6 +44,14 @@ extern "C" {
 /// Pages handed to the kernel heap at boot. Grows on demand later.
 const HEAP_PAGES: usize = 256;
 
+/// The userspace image, built from `os/user` by this crate's build script and
+/// embedded in the kernel. Stage 3 reads it off a filesystem instead.
+static INIT_ELF: &[u8] = include_bytes!(env!("JUNGEY_INIT_ELF"));
+
+extern "C" {
+    fn enter_user(entry: usize, user_sp: usize, arg: usize) -> !;
+}
+
 const BANNER: &str = r"
     _                              ___  ____
    | |_   _ _ __   __ _  ___ _   _/ _ \/ ___|
@@ -53,7 +66,7 @@ const RULE: &str = "  ----------------------------------------------------------
 #[no_mangle]
 pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
     println!("{}", BANNER);
-    println!("  Jungey OS  v0.2.0  ·  stage 1  ·  aarch64");
+    println!("  Jungey OS  v0.3.0  ·  stage 2  ·  aarch64");
     println!("{}", RULE);
 
     let (kstart, kend) = unsafe {
@@ -115,6 +128,10 @@ pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
     let (heap_total, _) = mm::heap::stats();
     println!("  heap       : {} KiB", heap_total / 1024);
 
+    // ---- user address spaces ----
+    mm::paging::init().expect("paging init");
+    println!("  paging     : ttbr0 live, 4 KiB pages, per-process asids");
+
     // ---- interrupt controller ----
     let mut gic_regs = [(0u64, 0u64); 2];
     if fdt.node_regs("arm,gic-v3", &mut gic_regs) < 2 {
@@ -138,61 +155,91 @@ pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
     println!("  irq        : unmasked");
     println!("{}", RULE);
 
-    stage1_demo();
+    stage2_demo();
 
     println!("{}", RULE);
-    println!("  stage 1 complete. handing the core to idle.");
+    println!("  stage 2 complete. handing the core to idle.");
     halt()
 }
 
 // ---------------------------------------------------------------------------
-// Stage 1 exit test: three threads sharing one core, preempted by the timer.
+// Stage 2 exit test: two processes exchange a message they could only exchange
+// because each was handed a capability, a third is denied for holding none,
+// and revoking the parent capability kills the whole subtree at once.
 // ---------------------------------------------------------------------------
 
-const WORKERS: [&str; 3] = ["alpha", "beta", "gamma"];
-/// How long the demo runs, in scheduler ticks.
-const RUN_TICKS: u64 = 150;
+/// When the kernel cuts the root capability, in scheduler ticks.
+const REVOKE_AT_TICK: u64 = 60;
 
-fn worker(id: usize) {
-    let name = WORKERS[id];
-    let mut iterations: u64 = 0;
-    let mut next_report = time::ticks() + 40;
-
-    while time::ticks() < RUN_TICKS {
-        iterations = iterations.wrapping_add(1);
-        if time::ticks() >= next_report {
-            next_report = time::ticks() + 40;
-            println!("  [{:>5}] tick {:>3}  {:>10} iterations", name, time::ticks(), iterations);
-        }
-    }
-    println!("  [{:>5}] done  {:>10} iterations", name, iterations);
+/// Kernel-side entry for a user thread: install the address space, then leave
+/// EL1 for good.
+fn user_thread(pid: usize) {
+    let p = proc::get(pid).expect("process vanished");
+    let (entry, sp, arg, ttbr0) = unsafe {
+        ((*p).entry, (*p).stack_top, (*p).arg, (*p).space.ttbr0())
+    };
+    mm::paging::activate(ttbr0);
+    unsafe { enter_user(entry, sp, arg) }
 }
 
-fn stage1_demo() {
-    println!("  spawning {} worker threads; timer preempts every {} ms", WORKERS.len(), 1000 / time::HZ);
+fn start_process(name: &'static str, role: usize, cap: Option<cap::Cap>) -> usize {
+    let pid = proc::create(name, INIT_ELF, role).expect("create process");
+    if let Some(c) = cap {
+        proc::install_cap(pid, 0, c).expect("install capability");
+    }
+    let tid = sched::spawn(name, user_thread, pid).expect("spawn user thread");
+    let ttbr0 = unsafe { (*proc::get(pid).unwrap()).space.ttbr0() };
+    sched::attach_process(tid, pid, ttbr0);
+    pid
+}
+
+fn stage2_demo() {
+    // One channel, and one capability to it: the root of all authority over it.
+    let channel = ipc::create();
+    let root = cap::Cap::root(cap::Obj::Channel(channel), cap::RIGHTS_ALL);
+    println!("  channel {} created; root capability #{} ({})", channel, root.id, root.rights_str());
+
+    // Derivation only ever narrows. Neither process can reconstruct the other's
+    // authority, and neither can widen its own.
+    let send_cap = root.derive(cap::RIGHT_SEND);
+    let recv_cap = root.derive(cap::RIGHT_RECV);
+    println!("  derived #{} ({}) and #{} ({}) from #{}",
+        send_cap.id, send_cap.rights_str(), recv_cap.id, recv_cap.rights_str(), root.id);
     println!();
 
-    for (i, name) in WORKERS.iter().enumerate() {
-        sched::spawn(name, worker, i).expect("spawn worker");
-    }
+    start_process("receiver", 1, Some(recv_cap));
+    start_process("sender", 0, Some(send_cap));
+    start_process("intruder", 2, None);
+    start_process("trespasser", 3, None);
 
-    // The boot thread is live too, so wait until it is the only one left.
+    // Let the first exchange happen, then cut the root. Sleeping rather than
+    // spinning means the core idles while the processes do their work.
+    sched::sleep_ticks(REVOKE_AT_TICK.saturating_sub(time::ticks()));
+    println!();
+    println!("  [kernel  ] revoking root capability #{}", root.id);
+    let killed = proc::revoke(root.id);
+    println!("  [kernel  ] {} derived capabilities died with it", killed);
+    println!();
+
     while sched::live_count() > 1 {
         sched::yield_now();
     }
 
-    // ---- second half: everyone asleep, so the core should actually stop ----
+    report();
+}
+
+fn report() {
     println!();
-    println!("  all workers done. sleeping the boot thread for 50 ticks —");
-    println!("  with an empty run queue the core must sit in WFI.");
-    let idle_before = sched::idle_wakeups();
-    let ticks_before = time::ticks();
-    sched::sleep_ticks(50);
-    println!(
-        "  woke after {} ticks; idle ran {} times while nothing was runnable",
-        time::ticks() - ticks_before,
-        sched::idle_wakeups() - idle_before
-    );
+    println!("  process        pid  exit  capability");
+    proc::for_each(|p| {
+        let cap_desc = match p.caps[0] {
+            Some(c) if c.revoked => alloc::format!("#{} {} REVOKED", c.id, c.rights_str()),
+            Some(c) => alloc::format!("#{} {}", c.id, c.rights_str()),
+            None => alloc::string::String::from("none"),
+        };
+        println!("  {:<12} {:>4} {:>5}  {}", p.name, p.pid,
+            p.exit_code.unwrap_or(-1), cap_desc);
+    });
 
     println!();
     println!("  thread          state  slices");
@@ -200,9 +247,12 @@ fn stage1_demo() {
         println!("  {:<12} {:>8}  {:>6}", t.name, t.state.label(), t.slices);
     });
 
+    let (sent, received, queued) = ipc::stats(0);
     let (spurious, unclaimed) = irq::stats();
     let (heap_total, heap_used) = mm::heap::stats();
     println!();
+    println!("  channel 0  : {} sent, {} received, {} queued", sent, received, queued);
+    println!("  caps       : {} minted", cap::minted());
     println!("  uptime     : {} ms ({} ticks)", time::uptime_ms(), time::ticks());
     println!("  irqs       : {} spurious, {} unclaimed", spurious, unclaimed);
     println!("  heap       : {} of {} bytes in use", heap_used, heap_total);

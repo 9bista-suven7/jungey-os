@@ -12,15 +12,17 @@ Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and
 
 ## Status
 
-**Stage 1 — it schedules.** The kernel boots on QEMU `virt`, drops from EL2 to
-EL1, turns the MMU on and relocates itself into the higher half, discovers its
-hardware from the device tree, allocates physical frames and heap, takes
-interrupts through a GICv3, and preemptively round-robins kernel threads off the
-generic timer.
+**Stage 2 — it runs processes.** On top of stage 1's MMU, scheduler and GICv3,
+the kernel now loads ELF images into isolated address spaces, runs them at EL0,
+and serves them seven system calls. A process's entire authority is the
+capabilities in its table: there is no ambient permission, no global name it can
+guess, and no way to widen a capability it was handed — only to narrow it.
+Revoking a capability kills everything derived from it, wherever it ended up.
 
 ## Run it
 
-Requirements: a Rust toolchain and `qemu-system-aarch64`.
+Requirements: a Rust toolchain and `qemu-system-aarch64`. The kernel's build
+script builds `os/user` and embeds the result, so one command builds both.
 
 ```bash
 rustup target add aarch64-unknown-none-softfloat
@@ -33,53 +35,69 @@ cd os
 
 Quit QEMU with `Ctrl-A` then `X`.
 
-Expected output:
+Expected output (abridged — the boot banner and hardware discovery come first):
 
 ```
-  Jungey OS  v0.2.0  ·  stage 1  ·  aarch64
+  Jungey OS  v0.3.0  ·  stage 2  ·  aarch64
   ----------------------------------------------------------
-  image      : 0xffff000040080000..0xffff0000400cf000  (316 KiB)
-  phys       : 0x0040080000..0x00400cf000
-  exec level : EL1
   mmu        : on, linear map at 0xffff000000000000
-  vectors    : installed at VBAR_EL1
-  dtb        : 0x0048000000 phys, 1048576 bytes
-  machine    : linux,dummy-virt
   console    : pl011 at 0x0009000000 (from dtb)
-  ram[0]     : 0x0040000000..0x00c0000000  (2048 MiB)
-  frames     : 523954 free of 523954 (2046 MiB usable)
-  heap       : 1024 KiB
+  paging     : ttbr0 live, 4 KiB pages, per-process asids
   gic        : v3 at 0x0008000000/0x00080a0000, 288 interrupt lines
   sched      : round-robin, thread 0 is 'boot'
   timer      : cntv at 62500000 Hz, tick 100 Hz, intid 27
-  irq        : unmasked
   ----------------------------------------------------------
-  spawning 3 worker threads; timer preempts every 10 ms
+  channel 0 created; root capability #1 (send+recv)
+  derived #2 (send) and #3 (recv) from #1
 
-  [alpha] tick  42    29937386 iterations
-  [ beta] tick  43    29872709 iterations
-  [gamma] tick  44    30126893 iterations
-  ...
-  all workers done. sleeping the boot thread for 50 ticks —
-  with an empty run queue the core must sit in WFI.
-  woke after 50 ticks; idle ran 49 times while nothing was runnable
+  [receiver] pid 0 wrote its pid to 0x0000000000402000, reads back 0
+  [receiver] blocking on my RECV capability
+  [sender  ] pid 1 wrote its pid to 0x0000000000402000, reads back 1
+  [sender  ] sending on my SEND capability
+  [sender  ] send ok
+  [sender  ] now trying to RECEIVE on the same capability
+  [sender  ] refused, as it should be: EPERM (capability lacks the right)
+  [receiver] got: "hello from the sender"
+  [intruder] holding no capability; trying slot 0 anyway
+  [intruder] denied: EBADCAP (no such capability)
+  [trespass] reading a kernel address from EL0
 
-  thread          state  slices
-  boot         runnable      53
-  idle         runnable       1
-  alpha        finished      51
-  beta         finished      51
-  gamma        finished      51
+  !! pid Some(3) fault: data abort, lower EL at elr 0x4002a8, far 0xffff000040080000
+  !! esr 0x000000009200000d — terminating the process
 
-  uptime     : 2000 ms (200 ticks)
+  [kernel  ] revoking root capability #1
+  [kernel  ] 2 derived capabilities died with it
+
+  [receiver] retrying the receive with the same capability
+  [receiver] dead: EREVOKED (capability was revoked)
+  [sender  ] retrying the send with the same capability
+  [sender  ] dead: EREVOKED (capability was revoked)
+
+  process        pid  exit  capability
+  receiver        0     0  #3 recv REVOKED
+  sender          1     0  #2 send REVOKED
+  intruder        2     0  none
+  trespasser      3    -1  none
+
+  channel 0  : 1 sent, 1 received, 0 queued
   irqs       : 0 spurious, 0 unclaimed
   ----------------------------------------------------------
-  stage 1 complete. handing the core to idle.
+  stage 2 complete. handing the core to idle.
 ```
 
-Equal slice counts across the three workers is the round-robin fairness check;
-49 idle wakeups during a 50-tick sleep is the proof the core actually stopped
-rather than spinning an empty run queue.
+Read that output as five separate claims, each of which fails loudly if broken:
+
+- **Authority is only what you hold.** The message crosses only because each
+  side was handed a capability.
+- **Rights narrow, never widen.** The sender holds SEND and is refused RECV.
+- **An index is not a name.** The intruder guesses slot 0 and gets `EBADCAP`.
+- **Address spaces are separate.** Both processes write to `0x402000` and read
+  back their own pid.
+- **Revocation cuts the subtree.** One call at the root; both derived
+  capabilities die; neither process was notified, they just find out.
+
+The trespasser reads a kernel address from EL0, is killed for it, and nothing
+else notices.
 
 Other invocations:
 
@@ -113,6 +131,11 @@ os/
 ├── docs/
 │   ├── ARCHITECTURE.md       the design and why it is shaped this way
 │   └── ROADMAP.md            stages 0-7, exit tests, honest costs
+├── user/                     userspace, built and embedded by the kernel build
+│   ├── linker.ld             loaded at 4 MiB, segments grouped by permission
+│   └── src/
+│       ├── main.rs           the four test roles
+│       └── sys.rs            syscall stubs — the whole kernel interface
 └── kernel/
     ├── linker.ld             image layout; linked high, loaded at 0x4008_0000
     ├── build.rs              wires the linker script into rustc
@@ -127,22 +150,38 @@ os/
         ├── gic.rs            GICv3 distributor, redistributor, CPU interface
         ├── time.rs           generic timer, 100 Hz scheduler tick
         ├── dtb.rs            flattened device tree reader
+        ├── cap.rs            capabilities: minting, derivation, revocation
+        ├── ipc.rs            channels and message queues
+        ├── proc.rs           processes: address space + capability table
+        ├── elf.rs            ELF64 loader
+        ├── syscall.rs        the seven system calls
         ├── sched/
         │   ├── mod.rs        threads, run queue, round-robin, sleep, idle
         │   └── switch.s      context switch and new-thread trampoline
         └── mm/
             ├── mod.rs        page constants, PHYS_OFFSET, phys<->virt
             ├── frames.rs     physical frame allocator with reservations
-            └── heap.rs       first-fit kernel heap behind GlobalAlloc
+            ├── heap.rs       first-fit kernel heap behind GlobalAlloc
+            ├── paging.rs     page tables, address spaces, permissions
+            └── uaccess.rs    copying across the user/kernel boundary
 ```
 
 ## Memory layout
 
 ```
-  VA 0xFFFF_0000_0000_0000 + PA        linear map of all physical memory
-  VA 0xFFFF_0000_4008_0000             kernel image (PA 0x4008_0000)
-  VA 0x0000_0000_0000_0000 .. low      unmapped: TCR_EL1.EPD0 disables TTBR0
+  TTBR1   VA 0xFFFF_0000_0000_0000 + PA   linear map of all physical memory
+          VA 0xFFFF_0000_4008_0000        kernel image (PA 0x4008_0000)
+
+  TTBR0   VA 0x0000_0000_0040_0000        user text   (r-x at EL0)
+          VA 0x0000_0000_0040_1000        user rodata (r-- at EL0)
+          VA 0x0000_0000_0040_2000        user data   (rw- at EL0)
+          VA 0x0000_0000_6FFF_C000        user stack, 16 KiB
 ```
+
+Every user mapping sets PXN, so a kernel bug that jumps into user memory faults
+instead of executing whatever the process put there. A kernel thread runs with
+TTBR0 pointing at an empty table rather than the last process's, so a stray low
+access is a translation fault and not someone else's data.
 
 The kernel is *linked* high and *loaded* low, so everything in `boot.s` before
 the MMU comes up addresses symbols PC-relatively (`adrp`), which yields physical
@@ -161,3 +200,10 @@ the higher half.
 - **Locks mask interrupts.** One core runs kernel code today, but IRQ handlers
   already preempt it, so a lock that does not mask would deadlock the core
   against itself.
+- **Anything the hardware keeps one copy of belongs in the exception frame.**
+  `ELR_EL1`, `SPSR_EL1` and `SP_EL0` are all per-core, not per-thread. The
+  scheduler switches threads from inside exception handlers, so leaving any of
+  them in a system register corrupts the thread being left — intermittently,
+  which is the worst way to find out.
+- **The kernel never dereferences a user pointer.** Every access goes through
+  `uaccess`, which translates via that process's own page tables first.

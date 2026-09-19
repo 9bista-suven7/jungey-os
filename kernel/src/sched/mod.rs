@@ -55,6 +55,8 @@ pub enum State {
     Runnable,
     /// Off the run queue until the tick counter reaches this value.
     Sleeping(u64),
+    /// Off the run queue until someone wakes this token — a channel id today.
+    Blocked(u64),
     Finished,
 }
 
@@ -63,6 +65,7 @@ impl State {
         match self {
             State::Runnable => "runnable",
             State::Sleeping(_) => "sleeping",
+            State::Blocked(_) => "blocked",
             State::Finished => "finished",
         }
     }
@@ -75,6 +78,12 @@ pub struct Thread {
     pub state: State,
     /// Times this thread has been switched to — the round-robin fairness metric.
     pub slices: u64,
+    /// The process this thread runs for, if it is a user thread.
+    pub pid: Option<usize>,
+    /// TTBR0 to install when this thread runs. The empty space for kernel
+    /// threads, so a stray low access faults instead of reading whatever
+    /// process ran last.
+    pub ttbr0: u64,
     #[allow(dead_code)] // freed when threads become reapable in stage 2
     stack_phys: usize,
 }
@@ -111,6 +120,8 @@ pub fn init() {
         ctx: Context::empty(),
         state: State::Runnable,
         slices: 1,
+        pid: None,
+        ttbr0: crate::mm::paging::empty_ttbr0(),
         stack_phys: 0, // the boot stack came from the linker, not the allocator
     }));
 
@@ -138,6 +149,8 @@ pub fn spawn(name: &'static str, entry: fn(usize), arg: usize) -> Option<usize> 
         ctx: Context::new(entry as usize, arg, stack_top),
         state: State::Runnable,
         slices: 0,
+        pid: None,
+        ttbr0: crate::mm::paging::empty_ttbr0(),
         stack_phys,
     }));
     s.threads.push(t);
@@ -190,7 +203,14 @@ pub fn schedule() {
         (prev, next_ptr)
     };
 
-    unsafe { cpu_switch_to(&mut (*prev).ctx, &(*next).ctx) };
+    // Address space first: the new thread must not run a single instruction
+    // against the old one's user mappings.
+    unsafe {
+        if (*next).ttbr0 != (*prev).ttbr0 {
+            crate::mm::paging::activate((*next).ttbr0);
+        }
+        cpu_switch_to(&mut (*prev).ctx, &(*next).ctx)
+    };
 
     // Reached again when someone switches back to this thread.
     irq_restore(daif);
@@ -234,6 +254,53 @@ pub fn sleep_ticks(ticks: u64) {
 /// How many times the idle thread has woken from WFI.
 pub fn idle_wakeups() -> u64 {
     IDLE_WAKEUPS.load(Ordering::Relaxed)
+}
+
+/// Leave the run queue until someone wakes `token`.
+pub fn block_on(token: u64) {
+    {
+        let s = SCHED.lock();
+        let cur = s.threads[s.current];
+        unsafe { (*cur).state = State::Blocked(token) };
+    }
+    loop {
+        schedule();
+        let s = SCHED.lock();
+        let cur = s.threads[s.current];
+        if unsafe { (*cur).state } != State::Blocked(token) {
+            return;
+        }
+    }
+}
+
+/// Make every thread blocked on `token` runnable again.
+pub fn wake_all_on(token: u64) {
+    let s = SCHED.lock();
+    for &t in s.threads.iter() {
+        unsafe {
+            if (*t).state == State::Blocked(token) {
+                (*t).state = State::Runnable;
+            }
+        }
+    }
+}
+
+/// Bind a thread to a process, so its syscalls resolve against that process's
+/// capability table and its user mappings are installed when it is scheduled.
+pub fn attach_process(tid: usize, pid: usize, ttbr0: u64) {
+    let s = SCHED.lock();
+    if let Some(&t) = s.threads.get(tid) {
+        unsafe {
+            (*t).pid = Some(pid);
+            (*t).ttbr0 = ttbr0;
+        }
+    }
+}
+
+/// Process the running thread belongs to.
+pub fn current_pid() -> Option<usize> {
+    let s = SCHED.lock();
+    unsafe { (*s.threads[s.current]).pid }
 }
 
 /// Yield without waiting for the tick.

@@ -169,12 +169,21 @@ the inference server and an app is a capability transfer, not a copy.
 
 ## 7. Current state
 
-Stages 0 and 1 are implemented (`os/kernel`): the kernel boots, runs in the
-higher half with the MMU on, allocates physical and heap memory, takes
-interrupts through a GICv3, and preemptively schedules kernel threads off the
-generic timer.
+Stages 0 through 2 are implemented (`os/kernel`, `os/user`): the kernel boots,
+runs in the higher half with the MMU on, allocates physical and heap memory,
+takes interrupts through a GICv3, preemptively schedules kernel threads off the
+generic timer, and runs isolated EL0 processes whose entire authority is the
+capabilities in their tables.
 
-None of section 3 exists yet — that is stages 5 and 6. What stage 1 buys is the
-substrate they need: an address space to map weight pages into, a scheduler to
-extend with QoS classes, and an interrupt path that will carry accelerator
-completions. See `ROADMAP.md` for what each stage delivers and what it costs.
+Section 3.3 — the capability broker — has its foundation in place. `cap.rs`
+implements minting, derivation that can only narrow rights, and subtree
+revocation over a ledger that stays walkable after the ancestors are gone. The
+delegation chains of stage 6 (user → agent → tool → resource) are that
+structure with provenance recorded per edge, and revoking an agent's authority
+is the `revoke` that already exists.
+
+Sections 3.1, 3.2 and 3.5 do not exist yet — they are stage 5. What stages 0-2
+buy is the substrate they need: address spaces to map weight pages into, a
+scheduler to extend with QoS classes, an interrupt path that will carry
+accelerator completions, and an authority model that an inference server can be
+held to. See `ROADMAP.md` for what each stage delivers and what it costs.

@@ -1,0 +1,17 @@
+[workspace]
+
+[package]
+name    = "jungey-init"
+version = "0.1.0"
+edition = "2021"
+description = "Jungey OS userspace test programs, loaded as EL0 processes"
+
+[[bin]]
+name = "init"
+path = "src/main.rs"
+
+[profile.release]
+panic     = "abort"
+lto       = true
+opt-level = "s"
+debug     = true

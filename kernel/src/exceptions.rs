@@ -7,6 +7,19 @@ extern "C" {
     static __vectors: u8;
 }
 
+/// Everything the vector entry pushed, in the order `vectors.s` pushes it.
+/// The scheduler can switch threads on top of one of these, so it has to hold
+/// ELR and SPSR too, not just the general-purpose registers.
+#[repr(C)]
+pub struct TrapFrame {
+    pub x: [u64; 31],
+    _pad: u64,
+    pub elr: u64,
+    pub spsr: u64,
+    pub sp_el0: u64,
+    _pad2: u64,
+}
+
 /// Point VBAR_EL1 at our table and unmask asynchronous aborts.
 pub fn init() {
     unsafe {
@@ -49,18 +62,39 @@ const fn is_irq(idx: u64) -> bool {
     idx & 3 == 1
 }
 
+/// ESR exception class for an SVC executed in AArch64 state.
+const EC_SVC64: u64 = 0b010101;
+
 #[no_mangle]
-pub extern "C" fn rust_exception(idx: u64, esr: u64, elr: u64, far: u64, sp: u64) {
+pub extern "C" fn rust_exception(idx: u64, esr: u64, elr: u64, far: u64, frame: *mut TrapFrame) {
     if is_irq(idx) {
         crate::irq::dispatch();
         return;
+    }
+
+    // A system call: synchronous, from a lower exception level.
+    if idx == 8 && esr >> 26 == EC_SVC64 {
+        crate::syscall::dispatch(unsafe { &mut *frame });
+        return;
+    }
+
+    // Anything else from EL0 kills the process rather than the kernel.
+    if idx == 8 {
+        let f = unsafe { &*frame };
+        println!();
+        println!(
+            "  !! pid {:?} fault: {} at elr {:#x}, far {:#x}, x30 {:#x}",
+            crate::sched::current_pid(), describe(esr), elr, far, f.x[30]
+        );
+        println!("  !! esr {:#018x} — terminating the process", esr);
+        crate::sched::thread_exit();
     }
 
     println!("\n*** EXCEPTION: {} ***", NAMES[(idx & 15) as usize]);
     println!("  esr_el1 = {:#018x}  ({})", esr, describe(esr));
     println!("  elr_el1 = {:#018x}", elr);
     println!("  far_el1 = {:#018x}", far);
-    println!("  sp      = {:#018x}", sp);
+    println!("  frame   = {:#018x}", frame as usize);
 
     // A data or instruction abort names the address that faulted; the low bits
     // of ESR say why the translation failed.

@@ -7,6 +7,8 @@
 
 pub mod frames;
 pub mod heap;
+pub mod paging;
+pub mod uaccess;
 
 pub const PAGE_SIZE: usize = 4096;
 pub const PAGE_SHIFT: usize = 12;

@@ -71,18 +71,82 @@ are abandoned; MMU bugs are silent and the debugger is a UART.*
 
 ---
 
-## Stage 2 — Userspace and capabilities
+## Stage 2 — Userspace and capabilities  ✅ *done*
 
-EL0 tasks, ELF loading, syscall path via `SVC`, address-space isolation, the
-capability table, `Endpoint` and `Channel` IPC, and the first userspace server
-(a RAM disk). Per-process capability derivation and revocation.
+EL0 processes, per-process page tables at 4 KiB granularity, an ELF64 loader,
+the `SVC` syscall path, capability tables with derivation and subtree
+revocation, and channel IPC with blocking receive.
 
 **Exit test:** two userspace processes exchange a message they could not have
 exchanged without an explicitly granted capability, and revoking the parent
-capability kills the channel for both.
+capability kills the channel for both. ✅
 
-*Cost: 2–4 months. The capability model is the project's thesis — get it wrong
-here and everything above inherits the mistake.*
+Measured on QEMU `virt`:
+
+```
+  channel 0 created; root capability #1 (send+recv)
+  derived #2 (send) and #3 (recv) from #1
+
+  [receiver] pid 0 wrote its pid to 0x0000000000402000, reads back 0
+  [sender  ] pid 1 wrote its pid to 0x0000000000402000, reads back 1
+  [sender  ] send ok
+  [sender  ] refused, as it should be: EPERM (capability lacks the right)
+  [receiver] got: "hello from the sender"
+  [intruder] denied: EBADCAP (no such capability)
+
+  !! pid Some(3) fault: data abort, lower EL at far 0xffff000040080000
+
+  [kernel  ] revoking root capability #1
+  [kernel  ] 2 derived capabilities died with it
+
+  [sender  ] dead: EREVOKED (capability was revoked)
+  [receiver] dead: EREVOKED (capability was revoked)
+```
+
+Five properties, each with its own line in that output:
+
+| Property | How it shows |
+|---|---|
+| Authority is only what you hold | receiver and sender exchange a message; neither could without its capability |
+| Rights attenuate, never widen | sender holds SEND, is refused RECV with `EPERM` |
+| No ambient authority | intruder guesses slot 0, gets `EBADCAP` — an index is not a name |
+| Address spaces are separate | both processes write to `0x402000` and read back their own pid |
+| Revocation kills the subtree | one cut at the root, both derived capabilities die, neither process was told |
+
+The trespasser process reads a kernel address from EL0 and is killed; every
+other process carries on, which is the other half of the isolation claim.
+
+**Two bugs worth recording, both silent and both intermittent:**
+
+- *`SP_EL0` was not saved across a context switch.* There is one `SP_EL0` per
+  core. Preempt a user thread inside a syscall, return to a different one, and
+  it resumes on the other process's stack pointer — reads a stale return
+  address, and branches to it. Failed roughly 2 runs in 10 before the exception
+  frame grew to carry it, which is exactly the frequency that gets a bug
+  shipped. `ELR_EL1` and `SPSR_EL1` had the same problem in stage 1; `SP_EL0`
+  is the one that is easy to forget because nothing in the kernel reads it.
+- *`enter_user` was interruptible between writing `ELR_EL1` and `eret`.*
+  Exception entry overwrites both `ELR_EL1` and `SPSR_EL1` with the interrupted
+  kernel state, so a timer tick in that window made the `eret` jump to a kernel
+  address at EL0. It now masks interrupts for the sequence; `eret` restores
+  `PSTATE` from `SPSR_EL1`, so the process is still preemptible from its first
+  instruction.
+
+Both were found by running the same build twelve times, not by reading the code.
+
+**Deviations from the plan, deliberate:**
+
+- *No userspace RAM disk server.* The init image is embedded in the kernel and
+  loaded from memory. A filesystem server needs a block driver, which is stage 3.
+- *One thread per process, and no reaping.* Exited processes keep their address
+  space and kernel stack. Both are stage 3 work, and both want the refcounted
+  handles that SMP needs anyway.
+- *`Endpoint` (synchronous rendezvous) is not implemented*, only `Channel`
+  (queued, asynchronous). Nothing in the exit test needs rendezvous semantics,
+  and the capability model is the same either way.
+
+*Cost: was estimated at 2–4 months. The capability model is the project's
+thesis — get it wrong here and everything above inherits the mistake.*
 
 ---
 
