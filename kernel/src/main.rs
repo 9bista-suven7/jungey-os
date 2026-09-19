@@ -29,6 +29,7 @@ pub mod smp;
 pub mod syscall;
 pub mod sync;
 pub mod time;
+pub mod virtio;
 
 #[global_allocator]
 static ALLOCATOR: mm::heap::KernelAllocator = mm::heap::KernelAllocator;
@@ -67,7 +68,7 @@ const RULE: &str = "  ----------------------------------------------------------
 #[no_mangle]
 pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
     println!("{}", BANNER);
-    println!("  Jungey OS  v0.4.0  ·  stage 3  ·  aarch64");
+    println!("  Jungey OS  v0.5.0  ·  stage 3  ·  aarch64");
     println!("{}", RULE);
 
     let (kstart, kend) = unsafe {
@@ -179,11 +180,14 @@ pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
     stage2_demo();
     heap_check("after stage 2");
     println!("{}", RULE);
-    stage3_demo();
-    heap_check("after stage 3");
+    stage3a_demo();
+    heap_check("after stage 3a");
+    println!("{}", RULE);
+    stage3b_demo(&fdt);
+    heap_check("after stage 3b");
 
     println!("{}", RULE);
-    println!("  stage 3a complete.");
+    println!("  stage 3b complete.");
 
     // The demos are the kernel's whole job right now, so stopping the machine
     // when they finish beats idling forever: `./run.sh` returns, and a stress
@@ -351,7 +355,7 @@ fn cores_str(mask: u64, buf: &mut [u8; 8]) -> &str {
     core::str::from_utf8(&buf[..n]).unwrap_or("?")
 }
 
-fn stage3_demo() {
+fn stage3a_demo() {
     println!(
         "  {} threads on {} cores, each taking one lock {} times",
         SMP_WORKERS,
@@ -419,6 +423,104 @@ fn heap_check(when: &str) {
             when, e, c.at, c.blocks
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3b exit test: a sector written on one boot is there on the next.
+// ---------------------------------------------------------------------------
+
+/// Where the persistence record lives. Sector 0 is left alone so the image
+/// stays something a partition table could later be written to.
+const RECORD_SECTOR: u64 = 64;
+/// Recognises our own record and nothing else.
+const RECORD_MAGIC: u64 = 0x4A55_4E47_4559_5F31; // "JUNGEY_1"
+
+fn le64(b: &[u8]) -> u64 {
+    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+}
+
+/// Fill the tail of the sector with a value-dependent pattern, so a read that
+/// returns the right header but the wrong body is still caught.
+fn pattern_byte(i: usize, boot: u64) -> u8 {
+    (i.wrapping_mul(31) as u64 ^ boot.wrapping_mul(131)) as u8
+}
+
+fn stage3b_demo(fdt: &dtb::Fdt) {
+    let Some((capacity, irq, queue_phys)) = virtio::init(fdt) else {
+        println!("  disk       : no virtio block device — run.sh attaches one with -drive");
+        return;
+    };
+    println!(
+        "  disk       : virtio-blk, {} sectors ({} MiB), intid {}, queue at {:#x}",
+        capacity,
+        capacity * virtio::SECTOR_SIZE as u64 / (1024 * 1024),
+        irq,
+        queue_phys
+    );
+
+    // ---- what the last boot left behind ----
+    let mut buf = [0u8; virtio::SECTOR_SIZE];
+    if let Err(e) = virtio::read_sector(RECORD_SECTOR, &mut buf) {
+        println!("  disk       : read failed — {}", e);
+        return;
+    }
+
+    let previous = if le64(&buf[0..8]) == RECORD_MAGIC {
+        let boot = le64(&buf[8..16]);
+        let ticks = le64(&buf[16..24]);
+        let text_end = buf[24..64].iter().position(|&b| b == 0).unwrap_or(40);
+        let text = core::str::from_utf8(&buf[24..24 + text_end]).unwrap_or("<invalid>");
+        println!("  previous   : boot {}, written at tick {}, \"{}\"", boot, ticks, text);
+
+        // The body has to match too, or a stale-but-plausible header passes.
+        let bad = (64..virtio::SECTOR_SIZE)
+            .filter(|&i| buf[i] != pattern_byte(i, boot))
+            .count();
+        if bad == 0 {
+            println!("  previous   : body verified, all {} pattern bytes match", virtio::SECTOR_SIZE - 64);
+        } else {
+            println!("  previous   : BODY CORRUPT — {} bytes differ", bad);
+        }
+        Some(boot)
+    } else {
+        println!("  previous   : none — this disk has never been written by us");
+        None
+    };
+
+    // ---- write this boot's record ----
+    let boot = previous.map_or(1, |b| b + 1);
+    let mut out = [0u8; virtio::SECTOR_SIZE];
+    out[0..8].copy_from_slice(&RECORD_MAGIC.to_le_bytes());
+    out[8..16].copy_from_slice(&boot.to_le_bytes());
+    out[16..24].copy_from_slice(&time::ticks().to_le_bytes());
+    let text = b"written by jungey os";
+    out[24..24 + text.len()].copy_from_slice(text);
+    for i in 64..virtio::SECTOR_SIZE {
+        out[i] = pattern_byte(i, boot);
+    }
+
+    if let Err(e) = virtio::write_sector(RECORD_SECTOR, &out) {
+        println!("  disk       : write failed — {}", e);
+        return;
+    }
+    println!("  wrote      : boot {} to sector {}", boot, RECORD_SECTOR);
+
+    // ---- read it straight back ----
+    let mut check = [0u8; virtio::SECTOR_SIZE];
+    if let Err(e) = virtio::read_sector(RECORD_SECTOR, &mut check) {
+        println!("  disk       : read-back failed — {}", e);
+        return;
+    }
+    let differing = (0..virtio::SECTOR_SIZE).filter(|&i| check[i] != out[i]).count();
+    if differing == 0 {
+        println!("  read back  : PASS — all {} bytes identical", virtio::SECTOR_SIZE);
+    } else {
+        println!("  read back  : FAIL — {} bytes differ", differing);
+    }
+
+    println!("  completion : {} interrupts from the device", virtio::irq_count());
+    println!();
+    println!("  boot again and 'previous' should read boot {}.", boot);
 }
 
 fn current_el() -> u64 {

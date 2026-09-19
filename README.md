@@ -12,6 +12,11 @@ Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and
 
 ## Status
 
+**Stage 3b — it has a disk.** A virtio-blk driver over the modern virtio-mmio
+transport: feature negotiation, a split virtqueue, physically addressed DMA
+buffers, and completion interrupts through the GIC. A sector written on one boot
+is read back on the next.
+
 **Stage 3a — it runs on every core.** Secondary cores are started through PSCI,
 per-CPU state lives on `TPIDR_EL1`, and threads — kernel and user alike —
 migrate freely between cores off one run queue. Locks are genuinely contended
@@ -89,9 +94,17 @@ first; see `docs/ROADMAP.md` for those):
 
   idle wakeups   : 298
   irqs           : 0 spurious, 0 unclaimed
-  heap check after stage 3 : ok — 4 free blocks, 1042432 bytes free
+  heap check after stage 3a : ok — 4 free blocks, 1042432 bytes free
   ----------------------------------------------------------
-  stage 3a complete.
+  virtio     : probing 32 mmio transports
+  disk       : virtio-blk, 131072 sectors (64 MiB), intid 79, queue at 0x40256000
+  previous   : boot 2, written at tick 90, "written by jungey os"
+  previous   : body verified, all 448 pattern bytes match
+  wrote      : boot 3 to sector 64
+  read back  : PASS — all 512 bytes identical
+  completion : 3 interrupts from the device
+  ----------------------------------------------------------
+  stage 3b complete.
   powering off via psci.
 ```
 
@@ -121,6 +134,13 @@ Read that output as a set of claims, each of which fails loudly if broken:
 - **The heap is intact.** Checked between stages, because corruption surfaces
   as a fault somewhere else entirely, thousands of instructions later.
 
+**Storage (stage 3b)**
+
+- **The disk remembers.** Boot twice and `previous` reads what the last boot
+  wrote. `./run.sh --fresh` starts from an empty image.
+- **The whole sector is checked**, not just a header: the body carries a
+  pattern derived from the boot number, so stale data cannot pass as fresh.
+
 The kernel powers off through PSCI when it finishes, so `./run.sh` returns
 rather than idling forever.
 
@@ -130,6 +150,7 @@ Other invocations:
 ./run.sh --debug     # debug build (no optimization, assertions on)
 ./run.sh --gdb       # halt and wait for a debugger on localhost:1234
 ./run.sh --fault     # dereference null on purpose, to see the fault report
+./run.sh --fresh     # start from an empty disk image
 ```
 
 `--fault` should print, and then panic:
@@ -175,6 +196,7 @@ os/
         ├── gic.rs            GICv3 distributor, redistributor, CPU interface
         ├── time.rs           generic timer, per-core 100 Hz tick
         ├── smp.rs            PSCI bring-up, per-CPU state on TPIDR_EL1
+        ├── virtio.rs         virtio-mmio transport and virtio-blk driver
         ├── dtb.rs            flattened device tree reader
         ├── cap.rs            capabilities: minting, derivation, revocation
         ├── ipc.rs            channels and message queues
@@ -240,3 +262,6 @@ the higher half.
 - **A thread is created stopped and started explicitly.** On four cores, a
   thread that is visible is a thread that is already running — before whatever
   was going to be attached to it has been.
+- **A driver never waits only on an interrupt.** Completion is polled with a
+  deadline; the interrupt is still taken, acknowledged and counted. An interrupt
+  that does not arrive should cost an error, not the machine.

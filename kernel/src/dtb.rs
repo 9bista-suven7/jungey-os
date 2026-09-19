@@ -29,6 +29,33 @@ fn be32_slice(v: &[u8]) -> u32 {
     u32::from_be_bytes([v[0], v[1], v[2], v[3]])
 }
 
+/// A device the kernel can attach a driver to.
+#[derive(Clone, Copy, Default)]
+pub struct DeviceNode {
+    pub base: u64,
+    pub size: u64,
+    /// GIC INTID, already converted from the device tree's per-type numbering.
+    pub irq: u32,
+}
+
+/// Convert a GIC `interrupts` entry to an INTID.
+///
+/// The device tree numbers interrupts within their type: SPIs and PPIs each
+/// start at 0. The GIC numbers them in one space, with PPIs at 16 and SPIs at
+/// 32 — a translation worth doing once, here, rather than in every driver.
+fn gic_intid(value: &[u8]) -> Option<u32> {
+    if value.len() < 12 {
+        return None;
+    }
+    let kind = be32_slice(&value[0..4]);
+    let number = be32_slice(&value[4..8]);
+    Some(match kind {
+        0 => number + 32, // SPI
+        1 => number + 16, // PPI
+        _ => return None,
+    })
+}
+
 /// A `compatible` property is a list of NUL-separated strings, most specific
 /// first. Match if any entry equals `want`.
 fn compat_matches(value: &[u8], want: &str) -> bool {
@@ -159,6 +186,63 @@ impl Fdt {
             }
         }
         0
+    }
+
+    /// A memory-mapped device: where its registers are and which interrupt it
+    /// raises.
+    ///
+    /// Everything a driver needs to attach, and nothing it can hardcode.
+    pub fn devices(&self, compatible: &str, out: &mut [DeviceNode]) -> usize {
+        let mut w = Walker::new(self);
+        let mut addr_cells = 2usize;
+        let mut size_cells = 2usize;
+        let mut compat: Option<&'static [u8]> = None;
+        let mut reg: Option<&'static [u8]> = None;
+        let mut interrupts: Option<&'static [u8]> = None;
+        let mut n = 0;
+
+        while let Some(ev) = w.next_event() {
+            if n >= out.len() {
+                break;
+            }
+            match ev {
+                Event::BeginNode { .. } => {
+                    compat = None;
+                    reg = None;
+                    interrupts = None;
+                }
+                Event::Prop { depth: 1, name: "#address-cells", value } if value.len() >= 4 => {
+                    addr_cells = be32_slice(value) as usize;
+                }
+                Event::Prop { depth: 1, name: "#size-cells", value } if value.len() >= 4 => {
+                    size_cells = be32_slice(value) as usize;
+                }
+                Event::Prop { name, value, .. } => {
+                    match name {
+                        "compatible" => compat = Some(value),
+                        "reg" => reg = Some(value),
+                        "interrupts" => interrupts = Some(value),
+                        _ => {}
+                    }
+                }
+                Event::EndNode => {
+                    let (Some(c), Some(r)) = (compat, reg) else { continue };
+                    if !compat_matches(c, compatible) || r.len() < (addr_cells + size_cells) * 4 {
+                        continue;
+                    }
+                    out[n] = DeviceNode {
+                        base: MemoryRegions::read_cells(r, 0, addr_cells),
+                        size: MemoryRegions::read_cells(r, addr_cells * 4, size_cells),
+                        irq: interrupts.and_then(gic_intid).unwrap_or(0),
+                    };
+                    n += 1;
+                    compat = None;
+                    reg = None;
+                    interrupts = None;
+                }
+            }
+        }
+        n
     }
 
     /// The value of `prop` on the first node advertising `compatible`.

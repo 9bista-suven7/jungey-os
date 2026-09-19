@@ -173,7 +173,8 @@ Stages 0 through 2 are implemented, and 3a (SMP) with them: the kernel boots,
 runs in the higher half with the MMU on, allocates physical and heap memory,
 takes interrupts through a GICv3, preemptively schedules kernel threads off the
 generic timer, and runs isolated EL0 processes whose entire authority is the
-capabilities in their tables, across all four cores of the machine.
+capabilities in their tables, across all four cores of the machine, and reads
+and writes a disk that remembers between boots.
 
 Section 3.3 — the capability broker — has its foundation in place. `cap.rs`
 implements minting, derivation that can only narrow rights, and subtree

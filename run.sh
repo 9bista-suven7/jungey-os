@@ -5,6 +5,7 @@
 #   ./run.sh --debug    debug build
 #   ./run.sh --gdb      halt and wait for a debugger on :1234
 #   ./run.sh --fault    end the demo with a deliberate null dereference
+#   ./run.sh --fresh    start from an empty disk image
 set -euo pipefail
 
 cd "$(dirname "$0")/kernel"
@@ -12,13 +13,15 @@ cd "$(dirname "$0")/kernel"
 PROFILE=release
 FEATURES=()
 QEMU_EXTRA=()
+FRESH=0
 
 for arg in "$@"; do
     case "$arg" in
         --debug) PROFILE=debug ;;
         --gdb)   QEMU_EXTRA+=(-s -S) ;;
         --fault) FEATURES+=(--features fault-demo) ;;
-        -h|--help) sed -n '2,7p' "$0"; exit 0 ;;
+        --fresh) FRESH=1 ;;
+        -h|--help) sed -n '2,8p' "$0"; exit 0 ;;
         *) echo "unknown option: $arg" >&2; exit 2 ;;
     esac
 done
@@ -38,6 +41,17 @@ BIN="target/jkernel.bin"
 OBJCOPY="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-objcopy"
 "$OBJCOPY" -O binary "$ELF" "$BIN"
 
+# A disk that survives between runs, which is the point of the stage 3b test:
+# boot twice and the kernel should read back what the previous boot wrote.
+#
+# force-legacy=false is required: QEMU's virtio-mmio transports default to the
+# legacy (version 1) interface for compatibility, and this kernel implements the
+# modern one. QEMU also fills the transport slots from the last one downwards,
+# so the driver probes all 32 rather than assuming slot 0.
+DISK="disk.img"
+[ "$FRESH" = 1 ] && rm -f "$DISK"
+[ -f "$DISK" ] || truncate -s 64M "$DISK"
+
 # gic-version=3 because the kernel drives a GICv3, the controller every AArch64
 # SoC worth targeting ships. QEMU still defaults `virt` to v2 for compatibility.
 exec qemu-system-aarch64 \
@@ -47,4 +61,7 @@ exec qemu-system-aarch64 \
     -m 2G \
     -nographic \
     -kernel "$BIN" \
+    -global virtio-mmio.force-legacy=false \
+    -drive file="$DISK",if=none,format=raw,id=hd0 \
+    -device virtio-blk-device,drive=hd0 \
     ${QEMU_EXTRA[@]+"${QEMU_EXTRA[@]}"}

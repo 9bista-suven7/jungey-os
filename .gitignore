@@ -4,5 +4,8 @@ target/
 # Flattened kernel image produced by run.sh
 *.bin
 
+# Disk image run.sh creates for the block-device test
+*.img
+
 .idea/
 .vscode/

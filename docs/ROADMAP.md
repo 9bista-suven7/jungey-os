@@ -214,13 +214,51 @@ property that makes this version reviewable — that there is exactly one place 
 thread's state can change. Revisit when a profile says the scheduler lock is
 hot.
 
-### 3b — Block driver  ⬜
+### 3b — Block driver  ✅ *done*
 
-virtio-blk in the kernel first: virtqueues, descriptor rings, DMA through the
-linear map, completion interrupts.
+virtio-mmio transport and a virtio-blk driver: feature negotiation, a split
+virtqueue with descriptor chains, DMA buffers addressed physically, and
+completion interrupts arriving as SPIs through the GIC.
 
 **Exit test:** write a sector, read it back on a fresh boot from the same disk
-image.
+image. ✅
+
+```
+  virtio     : probing 32 mmio transports
+  disk       : virtio-blk, 131072 sectors (64 MiB), intid 79, queue at 0x40256000
+  previous   : boot 2, written at tick 90, "written by jungey os"
+  previous   : body verified, all 448 pattern bytes match
+  wrote      : boot 3 to sector 64
+  read back  : PASS — all 512 bytes identical
+  completion : 3 interrupts from the device
+```
+
+20 consecutive boots against one disk image, the boot counter incrementing by
+one each time and the sector body verified against a value-dependent pattern —
+so a stale-but-plausible header cannot pass.
+
+**Two things QEMU makes you get right:**
+
+- *The transports default to legacy.* Every one of the 32 slots reports version
+  1 until `-global virtio-mmio.force-legacy=false`. This driver implements the
+  modern interface and refuses version 1 rather than half-supporting it.
+- *Slots fill from the last one downwards.* The block device lands in slot 31.
+  A driver that assumes slot 0 finds nothing, which is a good reason to probe.
+
+**Deviations:**
+
+- *Completion is polled, not awaited.* The interrupt fires, is acknowledged and
+  is counted, but the wait loop yields and checks the used ring rather than
+  blocking on the interrupt, with a two-second deadline. A driver that can only
+  be woken by an interrupt hangs the machine when the interrupt does not come.
+  Interrupt-driven completion belongs in 3d, where an IRQ becomes a message to a
+  driver process and a lost one is that process's problem.
+- *One request in flight, one sector at a time.* The queue is 8 deep and the
+  driver uses one slot of it. Batching is worth doing when something is waiting
+  on throughput; nothing is yet.
+- *DMA assumes a coherent device.* True under QEMU and on most ARM SoCs with
+  virtio. Real non-coherent hardware needs the queue and buffers mapped
+  non-cacheable, or explicit cache maintenance around every request.
 
 ### 3c — Filesystem  ⬜
 
