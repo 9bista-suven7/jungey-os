@@ -19,6 +19,7 @@ pub mod cap;
 pub mod dtb;
 pub mod elf;
 pub mod exceptions;
+pub mod fs;
 pub mod gic;
 pub mod ipc;
 pub mod irq;
@@ -68,7 +69,7 @@ const RULE: &str = "  ----------------------------------------------------------
 #[no_mangle]
 pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
     println!("{}", BANNER);
-    println!("  Jungey OS  v0.5.0  ·  stage 3  ·  aarch64");
+    println!("  Jungey OS  v0.6.0  ·  stage 3  ·  aarch64");
     println!("{}", RULE);
 
     let (kstart, kend) = unsafe {
@@ -185,9 +186,12 @@ pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
     println!("{}", RULE);
     stage3b_demo(&fdt);
     heap_check("after stage 3b");
+    println!("{}", RULE);
+    stage3c_demo();
+    heap_check("after stage 3c");
 
     println!("{}", RULE);
-    println!("  stage 3b complete.");
+    println!("  stage 3c complete.");
 
     // The demos are the kernel's whole job right now, so stopping the machine
     // when they finish beats idling forever: `./run.sh` returns, and a stress
@@ -521,6 +525,183 @@ fn stage3b_demo(fdt: &dtb::Fdt) {
     println!("  completion : {} interrupts from the device", virtio::irq_count());
     println!();
     println!("  boot again and 'previous' should read boot {}.", boot);
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3c exit test: a write cut short by a power failure leaves the
+// filesystem mountable, holding either the old contents or the new — never a
+// mix, and never a filesystem that will not mount.
+//
+// The test spans four boots and sequences itself through a phase marker stored
+// outside the filesystem, because it has to survive the filesystem being in a
+// state it was never meant to be in. `./test.sh` drives it.
+// ---------------------------------------------------------------------------
+
+const FILE: &str = "hello.txt";
+
+/// Deterministic file contents for version `v`, so a read can be checked byte
+/// for byte rather than eyeballed.
+fn contents(v: u8, len: usize) -> alloc::vec::Vec<u8> {
+    let mut out = alloc::vec::Vec::with_capacity(len);
+    let header: &[u8] = match v {
+        1 => b"v1: written before the crash test\n",
+        _ => b"v2: written after the crash test\n",
+    };
+    out.extend_from_slice(header);
+    while out.len() < len {
+        out.push((out.len().wrapping_mul(7) as u8) ^ v.wrapping_mul(97));
+    }
+    out
+}
+
+fn verify(fs: &fs::Fs, v: u8, len: usize) -> bool {
+    let want = contents(v, len);
+    let mut got = alloc::vec![0u8; len];
+    match fs.read(FILE, &mut got) {
+        Ok(n) if n == len && got == want => {
+            println!("  verify     : PASS — {} holds v{}, all {} bytes match", FILE, v, len);
+            true
+        }
+        Ok(n) => {
+            println!("  verify     : FAIL — read {} bytes, expected {} of v{}", n, len, v);
+            false
+        }
+        Err(e) => {
+            println!("  verify     : FAIL — {}", e);
+            false
+        }
+    }
+}
+
+const V1_LEN: usize = 1100; // three sectors, so a partial write is possible
+const V2_LEN: usize = 1600;
+
+fn stage3c_demo() {
+    if !virtio::have_disk() {
+        println!("  fs         : no disk, skipping");
+        return;
+    }
+
+    let phase = fs::read_phase();
+    println!("  fs         : crash-consistency test, phase {}", phase);
+
+    match phase {
+        0 => {
+            // Fresh disk: lay down a filesystem and one committed file.
+            if let Err(e) = fs::format(virtio::capacity_sectors()) {
+                println!("  fs         : format failed — {}", e);
+                return;
+            }
+            println!("  format     : superblock and checkpoint A written");
+            let Ok(mut f) = mounted() else { return };
+            if let Err(e) = f.write(FILE, &contents(1, V1_LEN), None) {
+                println!("  write      : failed — {}", e);
+                return;
+            }
+            println!("  write      : {} v1 committed, checkpoint seq {}", FILE, f.cp.seq);
+            let _ = fs::write_phase(1);
+            println!();
+            println!("  next boot  : verifies v1, then crashes mid-write on purpose.");
+        }
+        1 | 2 => {
+            let Ok(mut f) = mounted() else {
+                println!("  RESULT     : FAIL — filesystem will not mount");
+                return;
+            };
+            println!("  mounted    : checkpoint seq {} from slot {}", f.cp.seq, f.slot);
+
+            // Phase 2 is the recovery check for phase 1's crash, and the setup
+            // for a harder one. Every boot after a crash re-verifies v1.
+            if !verify(&f, 1, V1_LEN) {
+                println!("  RESULT     : FAIL — an interrupted write was partly visible");
+                return;
+            }
+            if phase == 2 {
+                println!("  RESULT     : PASS — the mid-data crash left no trace");
+                let (used, garbage) = f.usage();
+                // The crashed sectors sit past log_head, which never moved
+                // because the checkpoint never landed. The next write reuses
+                // them: a crash costs nothing, not even space.
+                println!(
+                    "  log        : {} sectors used, {} garbage — the crash cost no space",
+                    used, garbage
+                );
+            }
+
+            // Record the next phase *before* crashing, or this boot repeats
+            // forever. The marker lives outside the filesystem for exactly
+            // this reason.
+            let _ = fs::write_phase(phase + 1);
+            let v2 = contents(2, V2_LEN);
+            let full = v2.len().div_ceil(virtio::SECTOR_SIZE) as u32;
+            // First a crash part way through the data, then one with every byte
+            // written and only the commit missing.
+            let point = if phase == 1 { 1 } else { full };
+            println!("  about to   : write v2 and lose power after {} of {} sectors", point, full);
+            println!();
+            let _ = f.write(FILE, &v2, Some(point)); // does not return
+        }
+        3 => {
+            // The hardest case: all of v2's data is on the disk, and nothing
+            // points at it.
+            let Ok(mut f) = mounted() else {
+                println!("  RESULT     : FAIL — filesystem will not mount after the crash");
+                return;
+            };
+            println!("  mounted    : checkpoint seq {} from slot {}", f.cp.seq, f.slot);
+            if verify(&f, 1, V1_LEN) {
+                println!("  RESULT     : PASS — a fully written but uncommitted file is invisible");
+            } else {
+                println!("  RESULT     : FAIL — the interrupted write was partly visible");
+                return;
+            }
+            let (used, garbage) = f.usage();
+            println!(
+                "  log        : {} sectors used, {} garbage — both crashes cost no space",
+                used, garbage
+            );
+
+            if let Err(e) = f.write(FILE, &contents(2, V2_LEN), None) {
+                println!("  write      : failed — {}", e);
+                return;
+            }
+            println!("  write      : {} v2 committed, checkpoint seq {}", FILE, f.cp.seq);
+            let _ = fs::write_phase(4);
+            println!();
+            println!("  next boot  : confirms v2 survived a clean shutdown.");
+        }
+        _ => {
+            let Ok(f) = mounted() else { return };
+            println!("  mounted    : checkpoint seq {} from slot {}", f.cp.seq, f.slot);
+            let ok = verify(&f, 2, V2_LEN);
+            let (used, garbage) = f.usage();
+            println!(
+                "  log        : {} sectors used, {} garbage from rewriting v1",
+                used, garbage
+            );
+            println!("  directory  :");
+            for e in f.files() {
+                println!("    {:<12} {:>6} bytes at sector {}", e.name_str(), e.size, e.start);
+            }
+            println!();
+            if ok {
+                println!("  RESULT     : PASS — crash consistency test complete, all five boots");
+            } else {
+                println!("  RESULT     : FAIL — v2 did not survive");
+            }
+            let _ = fs::write_phase(5);
+        }
+    }
+}
+
+fn mounted() -> Result<fs::Fs, ()> {
+    match fs::mount() {
+        Ok(f) => Ok(f),
+        Err(e) => {
+            println!("  mount      : failed — {}", e);
+            Err(())
+        }
+    }
 }
 
 fn current_el() -> u64 {

@@ -12,6 +12,12 @@ Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and
 
 ## Status
 
+**Stage 3c — it has a filesystem that survives power loss.** JLFS: an
+append-only log with two checkpoint slots, where committing is a single sector
+write. Pull the plug part way through a write and the next mount sees the old
+contents, whole. `./test.sh` proves it across five boots, cutting power for real
+with PSCI `SYSTEM_OFF`.
+
 **Stage 3b — it has a disk.** A virtio-blk driver over the modern virtio-mmio
 transport: feature negotiation, a split virtqueue, physically addressed DMA
 buffers, and completion interrupts through the GIC. A sector written on one boot
@@ -43,7 +49,15 @@ cd os
 ./run.sh
 ```
 
-Quit QEMU with `Ctrl-A` then `X`.
+Quit QEMU with `Ctrl-A` then `X`, though the kernel powers the machine off when
+its demos finish, so `./run.sh` normally returns on its own in about a second.
+
+To run every stage's exit test end to end:
+
+```bash
+./test.sh              # five boots from an empty disk, 26 checks
+./test.sh --repeat 5   # the whole thing five times over, to shake out races
+```
 
 Expected output (abridged — hardware discovery and the capability demo come
 first; see `docs/ROADMAP.md` for those):
@@ -104,7 +118,14 @@ first; see `docs/ROADMAP.md` for those):
   read back  : PASS — all 512 bytes identical
   completion : 3 interrupts from the device
   ----------------------------------------------------------
-  stage 3b complete.
+  fs         : crash-consistency test, phase 3
+  mounted    : checkpoint seq 2 from slot 1
+  verify     : PASS — hello.txt holds v1, all 1100 bytes match
+  RESULT     : PASS — a fully written but uncommitted file is invisible
+  log        : 3 sectors used, 0 garbage — both crashes cost no space
+  write      : hello.txt v2 committed, checkpoint seq 3
+  ----------------------------------------------------------
+  stage 3c complete.
   powering off via psci.
 ```
 
@@ -141,6 +162,16 @@ Read that output as a set of claims, each of which fails loudly if broken:
 - **The whole sector is checked**, not just a header: the body carries a
   pattern derived from the boot number, so stale data cannot pass as fresh.
 
+**Crash consistency (stage 3c)**
+
+- **A cut write is invisible.** Power is lost part way through the data on one
+  boot and with the data complete on the next. Both times the filesystem mounts
+  and reports the *old* contents, entire. The second case is the one that
+  separates a crash-consistent filesystem from a tidy-looking one.
+- **The crash costs no space.** Orphaned sectors sit past `log_head`, which
+  never advanced because the checkpoint never landed, so the next write reuses
+  them.
+
 The kernel powers off through PSCI when it finishes, so `./run.sh` returns
 rather than idling forever.
 
@@ -174,6 +205,7 @@ gdb-multiarch os/kernel/target/aarch64-unknown-none-softfloat/release/jkernel \
 ```
 os/
 ├── run.sh                    build + boot under QEMU
+├── test.sh                   every stage's exit test, end to end
 ├── docs/
 │   ├── ARCHITECTURE.md       the design and why it is shaped this way
 │   └── ROADMAP.md            stages 0-7, exit tests, honest costs
@@ -197,6 +229,7 @@ os/
         ├── time.rs           generic timer, per-core 100 Hz tick
         ├── smp.rs            PSCI bring-up, per-CPU state on TPIDR_EL1
         ├── virtio.rs         virtio-mmio transport and virtio-blk driver
+        ├── fs.rs             JLFS: append-only log, two checkpoint slots
         ├── dtb.rs            flattened device tree reader
         ├── cap.rs            capabilities: minting, derivation, revocation
         ├── ipc.rs            channels and message queues
@@ -265,3 +298,8 @@ the higher half.
 - **A driver never waits only on an interrupt.** Completion is polled with a
   deadline; the interrupt is still taken, acknowledged and counted. An interrupt
   that does not arrive should cost an error, not the machine.
+- **On-disk formats are written out by hand**, field by field at fixed offsets,
+  never by casting a struct. Layout is part of the format, and a silent change
+  to a Rust type must not be able to change what is on someone's disk.
+- **A test that has to survive a broken filesystem cannot live inside it.** The
+  crash test's phase marker sits in its own sector, outside JLFS entirely.

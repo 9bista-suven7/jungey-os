@@ -260,13 +260,62 @@ so a stale-but-plausible header cannot pass.
   virtio. Real non-coherent hardware needs the queue and buffers mapped
   non-cacheable, or explicit cache maintenance around every request.
 
-### 3c — Filesystem  ⬜
+### 3c — Filesystem  ✅ *done*
 
-A log-structured filesystem, because flash, and because crash consistency for
-the agent's action log is a stage 6 requirement that has to be designed in here.
+JLFS: an append-only log with two checkpoint slots. Data is written to the log
+first, then a single-sector checkpoint switches the filesystem's root. A crash
+either loses the checkpoint — and with it every trace of the unfinished write —
+or lands after it, with the data already durable. There is no order in which a
+reader sees half of one.
 
 **Exit test:** a file written and then power-cut mid-write leaves the filesystem
-mountable, with either the old contents or the new, never a mix.
+mountable, with either the old contents or the new, never a mix. ✅
+
+The test spans five boots and sequences itself through a marker stored *outside*
+the filesystem, because it has to survive the filesystem being in a state it was
+never meant to be in. `./test.sh` drives it; power is cut for real, with PSCI
+`SYSTEM_OFF`, not simulated.
+
+```
+boot 2   verify     : PASS — hello.txt holds v1, all 1100 bytes match
+         crash      : power cut after 1 of 4 data sectors
+
+boot 3   mounted    : checkpoint seq 2 from slot 1
+         verify     : PASS — hello.txt holds v1, all 1100 bytes match
+         RESULT     : PASS — the mid-data crash left no trace
+         crash      : power cut with all 4 data sectors written, checkpoint skipped
+
+boot 4   mounted    : checkpoint seq 2 from slot 1
+         RESULT     : PASS — a fully written but uncommitted file is invisible
+         write      : hello.txt v2 committed, checkpoint seq 3
+
+boot 5   verify     : PASS — hello.txt holds v2, all 1600 bytes match
+         RESULT     : PASS — crash consistency test complete, all five boots
+```
+
+Two crash points, and the second is the one that matters: every byte of the new
+file is on the disk and the filesystem still reports the old contents, because
+nothing points at the new ones. A filesystem that merely looks tidy fails that
+case.
+
+The crashes cost no space, either. The orphaned sectors sit past `log_head`,
+which never advanced because the checkpoint never landed, so the next write
+reuses them.
+
+**Assumption, stated rather than buried:** a single sector write is atomic — it
+lands whole or not at all. Every journalling filesystem assumes this. The
+checkpoint CRC catches the case where the hardware breaks its promise, which
+turns silent corruption into a refusal to mount that slot.
+
+**Deviations:**
+
+- *Flat directory, 8 files, one sector.* The log and the atomic root swap are
+  what this stage is about; a B-tree is a later problem and does not change the
+  consistency argument.
+- *No cleaner.* A rewrite orphans the old sectors and nothing reclaims them.
+  The other half of a log-structured filesystem, and one that wants a real
+  workload to be tuned against rather than a guess.
+- *Whole-file writes only.* No partial updates, no append, no seek.
 
 ### 3d — Userspace drivers  ⬜
 

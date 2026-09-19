@@ -173,8 +173,8 @@ Stages 0 through 2 are implemented, and 3a (SMP) with them: the kernel boots,
 runs in the higher half with the MMU on, allocates physical and heap memory,
 takes interrupts through a GICv3, preemptively schedules kernel threads off the
 generic timer, and runs isolated EL0 processes whose entire authority is the
-capabilities in their tables, across all four cores of the machine, and reads
-and writes a disk that remembers between boots.
+capabilities in their tables, across all four cores of the machine, and stores files on a
+log-structured filesystem that survives having its power cut mid-write.
 
 Section 3.3 — the capability broker — has its foundation in place. `cap.rs`
 implements minting, derivation that can only narrow rights, and subtree
@@ -182,6 +182,11 @@ revocation over a ledger that stays walkable after the ancestors are gone. The
 delegation chains of stage 6 (user → agent → tool → resource) are that
 structure with provenance recorded per edge, and revoking an agent's authority
 is the `revoke` that already exists.
+
+Section 3.3's other half — the tamper-evident log of what an agent did, and
+transactional intents that can be undone — now has something to be built on:
+JLFS commits by switching a root atomically, which is the same primitive an
+undoable action log needs.
 
 Sections 3.1, 3.2 and 3.5 do not exist yet — they are stage 5. What stages 0-2
 buy is the substrate they need: address spaces to map weight pages into, a

@@ -395,6 +395,16 @@ pub fn write_sector(sector: u64, data: &[u8]) -> Result<(), &'static str> {
     d.as_mut().ok_or("no disk")?.write_sector(sector, data)
 }
 
+/// Is a block device attached?
+pub fn have_disk() -> bool {
+    DISK.lock().is_some()
+}
+
+/// Size of the attached disk, in sectors.
+pub fn capacity_sectors() -> u64 {
+    DISK.lock().as_ref().map(|d| d.capacity_sectors).unwrap_or(0)
+}
+
 /// Completion interrupts taken since boot.
 pub fn irq_count() -> u64 {
     IRQ_COUNT.load(Ordering::Relaxed)
