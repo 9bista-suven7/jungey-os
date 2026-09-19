@@ -11,12 +11,16 @@
 #   ./sim.sh --out DIR       where to put them (default ./screenshots)
 set -euo pipefail
 
+# Fail with something useful if the toolchain is missing, rather than letting
+# the shell report "cargo: command not found". Resolved before any cd, so it
+# works whatever directory you invoke this from.
+JUNGEY_ROOT="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=tools/preflight.sh
+. "$JUNGEY_ROOT/tools/preflight.sh"
+preflight yes
+
 cd "$(dirname "$0")"
 
-# Fail with something useful if the toolchain is missing.
-# shellcheck source=tools/preflight.sh
-. "$(dirname "$0")/tools/preflight.sh"
-preflight yes
 
 GUI=0
 SHOTS=3
