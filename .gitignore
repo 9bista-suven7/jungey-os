@@ -1,0 +1,8 @@
+# Rust build output, for both the kernel and the userspace crate
+target/
+
+# Flattened kernel image produced by run.sh
+*.bin
+
+.idea/
+.vscode/
