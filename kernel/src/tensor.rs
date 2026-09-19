@@ -91,9 +91,13 @@ const INITIAL_SEGMENT_US: u64 = 1000;
 // number, not the number.
 
 /// How much one segment heats the device, in thousandths of a degree.
-const RISE_PER_SEGMENT_MILLI_C: u64 = 400;
+///
+/// Chosen so that a few hundred segments span the whole range from ambient to
+/// critical: a model where any realistic workload saturates instantly cannot
+/// demonstrate the band between the two limits, which is the part that matters.
+const RISE_PER_SEGMENT_MILLI_C: u64 = 200;
 /// How fast it cools when the device is idle, per millisecond.
-const DECAY_PER_MS_MILLI_C: u64 = 100;
+const DECAY_PER_MS_MILLI_C: u64 = 120;
 /// Above this, work nobody is waiting for is refused. Deliberately early: the
 /// point of having classes is that something yields long before the device is
 /// in trouble.

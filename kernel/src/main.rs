@@ -1537,6 +1537,25 @@ fn try_submit(what: &str, qos: tensor::Qos, segments: u32, budget: Option<u64>) 
     }
 }
 
+/// Run work until the device reaches `target`, or give up.
+///
+/// Heating to a fixed segment count is hostage to the cooling rate and the
+/// measured segment cost: change either and the test either misses the band it
+/// is aiming for or overshoots it. Aiming at a temperature is the same thing
+/// the scheduler itself does and does not need retuning when the model does.
+fn heat_until(target_milli_c: u64, qos: tensor::Qos, what: &str) -> bool {
+    for _ in 0..16 {
+        if tensor::temperature() >= target_milli_c {
+            return true;
+        }
+        if tensor::submit(usize::MAX, qos, 60, None).is_err() {
+            break; // the device will not take any more of this class
+        }
+        wait_for_idle(what);
+    }
+    tensor::temperature() >= target_milli_c
+}
+
 fn wait_for_idle(what: &str) {
     wait_until(
         || {
@@ -1570,10 +1589,12 @@ fn stage5d_demo() {
 
     // ---- heat it up ----
     println!();
-    println!("  heating    : 60 segments of background work");
-    if tensor::submit(usize::MAX, tensor::Qos::Background, 60, None).is_ok() {
-        wait_for_idle("the device to get hot");
-    }
+    println!("  heating    : background work until the device passes the throttle point");
+    heat_until(
+        tensor::throttle_point() + 2_000,
+        tensor::Qos::Background,
+        "the device to warm up",
+    );
     let hot = tensor::temperature();
     println!("    device now at {} above ambient (peak {})", degrees(hot), degrees(tensor::peak_temperature()));
 
@@ -1590,16 +1611,16 @@ fn stage5d_demo() {
 
     // ---- critical: nothing new at all ----
     println!();
-    println!("  heating    : another 60 segments, past the critical point");
-    if tensor::submit(usize::MAX, tensor::Qos::Background, 60, None).is_ok() {
-        wait_for_idle("the device to reach critical");
-    } else {
-        // Already too hot to admit background work; heat with interactive
-        // instead, which is still allowed below critical.
-        if tensor::submit(usize::MAX, tensor::Qos::Interactive, 60, None).is_ok() {
-            wait_for_idle("the device to reach critical");
-        }
-    }
+    // Background work is already refused up here, so the heating is done with
+    // interactive work — which is exactly the situation the critical point
+    // exists for: the only thing still running is the thing that cannot be
+    // put off, and eventually even that has to stop.
+    println!("  heating    : interactive work until the device passes critical");
+    heat_until(
+        tensor::critical_point() + 2_000,
+        tensor::Qos::Interactive,
+        "the device to reach critical",
+    );
     println!("    device now at {} above ambient", degrees(tensor::temperature()));
     println!("  critical device:");
     let interactive_refused =
@@ -1608,7 +1629,7 @@ fn stage5d_demo() {
     // ---- let it cool ----
     println!();
     println!("  cooling    : idling until the device drops below the throttle point");
-    sched::sleep_ticks(80);
+    sched::sleep_ticks(90);
     let cooled = tensor::temperature();
     println!("    device now at {} above ambient", degrees(cooled));
     let readmitted = try_submit("opportunistic work", tensor::Qos::Opportunistic, 4, None).is_some();

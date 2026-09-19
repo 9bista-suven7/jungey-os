@@ -315,8 +315,9 @@ fn infer_interactive() {
     const TAG: &str = "  [infer-ui]";
 
     // Let the background job get hold of the device first, so this genuinely
-    // has to take it away rather than just finding it free.
-    sleep(5);
+    // has to take it away rather than just finding it free — but not so long
+    // that the background job has finished and there is nothing to take.
+    sleep(3);
 
     say(TAG, " submitting 5 interactive segments with a 50 ms deadline");
     let id = tensor_submit(QOS_INTERACTIVE, 5, 50_000);
