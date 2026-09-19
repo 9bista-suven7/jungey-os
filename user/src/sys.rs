@@ -14,6 +14,14 @@ pub const SYS_IRQ_WAIT: usize = 10;
 pub const SYS_MODEL_OPEN: usize = 11;
 pub const SYS_MODEL_MAP: usize = 12;
 pub const SYS_MODEL_INFO: usize = 13;
+pub const SYS_TENSOR_SUBMIT: usize = 14;
+pub const SYS_TENSOR_WAIT: usize = 15;
+pub const SYS_TENSOR_STAT: usize = 16;
+
+pub const QOS_INTERACTIVE: usize = 0;
+pub const QOS_FOREGROUND: usize = 1;
+pub const QOS_BACKGROUND: usize = 2;
+pub const QOS_OPPORTUNISTIC: usize = 3;
 
 #[inline(always)]
 unsafe fn syscall3(n: usize, a: usize, b: usize, c: usize) -> isize {
@@ -202,6 +210,26 @@ pub fn model_map(id: usize, at: usize) -> isize {
 /// faults, pages reclaimed, reference count.
 pub fn model_info(id: usize, out: &mut [u64; 8]) -> isize {
     unsafe { syscall3(SYS_MODEL_INFO, id, out.as_mut_ptr() as usize, 0) }
+}
+
+/// Offer inference work to the accelerator.
+///
+/// `deadline_us` of 0 means no deadline. A negative result means the work was
+/// refused — the deadline could not be met, so the caller gets to choose a
+/// smaller model rather than a stutter.
+pub fn tensor_submit(qos: usize, segments: usize, deadline_us: usize) -> isize {
+    unsafe { syscall3(SYS_TENSOR_SUBMIT, qos, segments, deadline_us) }
+}
+
+/// Wait for a job. 1 if it finished, negative on timeout.
+pub fn tensor_wait(id: usize, timeout_ticks: usize) -> isize {
+    unsafe { syscall3(SYS_TENSOR_WAIT, id, timeout_ticks, 0) }
+}
+
+/// Fill `out` with eleven u64s: id, class, segments, done, latency us,
+/// deadline us, deadline met, preemptions, energy uj, device us, state.
+pub fn tensor_stat(id: usize, out: &mut [u64; 11]) -> isize {
+    unsafe { syscall3(SYS_TENSOR_STAT, id, out.as_mut_ptr() as usize, 0) }
 }
 
 /// Wait for our device's interrupt, up to `timeout` scheduler ticks. Returns

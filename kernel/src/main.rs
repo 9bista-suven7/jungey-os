@@ -29,6 +29,7 @@ pub mod proc;
 pub mod sched;
 pub mod smp;
 pub mod syscall;
+pub mod tensor;
 pub mod blk;
 pub mod devices;
 pub mod sync;
@@ -71,7 +72,7 @@ const RULE: &str = "  ----------------------------------------------------------
 #[no_mangle]
 pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
     println!("{}", BANNER);
-    println!("  Jungey OS  v0.8.0  ·  stage 5a  ·  aarch64");
+    println!("  Jungey OS  v0.9.0  ·  stage 5b  ·  aarch64");
     println!("{}", RULE);
 
     let (kstart, kend) = unsafe {
@@ -197,6 +198,9 @@ pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
     println!("{}", RULE);
     stage5a_demo();
     heap_check("after stage 5a");
+    println!("{}", RULE);
+    stage5b_demo();
+    heap_check("after stage 5b");
 
     println!("{}", RULE);
     if blk::attached() {
@@ -207,7 +211,7 @@ pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
             blk::stale_replies()
         );
     }
-    println!("  stage 5a complete.");
+    println!("  stage 5b complete.");
 
     // The demos are the kernel's whole job right now, so stopping the machine
     // when they finish beats idling forever: `./run.sh` returns, and a stress
@@ -965,6 +969,147 @@ fn stage5a_demo() {
     println!();
     println!("  dedup      : two opens of the same bytes produced one object, {} references", 2);
     println!("  frames     : {} free at the end, {} at the start", mm::frames::free_count(), free_before);
+}
+
+// ---------------------------------------------------------------------------
+// Stage 5b exit test: a long background job is preempted mid-run by an
+// interactive one that meets a 50 ms deadline, and both jobs' costs land on
+// the right job.
+//
+// The claim being tested is ARCHITECTURE.md section 3.1 — that accelerator time
+// should be scheduled rather than served in arrival order. Today an NPU has no
+// notion of priority, so the keyboard waits behind whatever was asked first.
+// ---------------------------------------------------------------------------
+
+fn stage5b_demo() {
+    // One device, one worker. It is a service: it waits for work rather than
+    // finishing.
+    let tid = sched::spawn_stopped("tensor0", tensor::worker, 0).expect("tensor worker");
+    sched::mark_service(tid);
+    sched::start(tid);
+
+    // Calibrate before admitting anything with a deadline. Admission control is
+    // only as honest as its estimate of what a segment costs, and that is
+    // measured here rather than assumed.
+    let warm = tensor::submit(usize::MAX, tensor::Qos::Foreground, 4, None).ok();
+    if warm.is_some() {
+        wait_until(
+            || tensor::totals().0 >= 4,
+            "the device to calibrate",
+        );
+    }
+    println!(
+        "  tensor     : device up, measured {} us per segment",
+        tensor::segment_cost_us()
+    );
+    println!();
+
+    // An opportunistic job alongside the background one: it should barely move
+    // while anything else wants the device, and finish once nothing does.
+    let opportunistic = tensor::submit(usize::MAX, tensor::Qos::Opportunistic, 20, None).ok();
+
+    start_process("inferbg", 8, &[]);
+    start_process("inferui", 7, &[]);
+
+    wait_until(|| sched::live_count() <= 1, "both inference jobs to finish");
+
+    // How far the opportunistic job got while the device was contended, before
+    // letting it have what is left.
+    let (opp_busy, opp_total) = match opportunistic {
+        Some(id) => tensor::stat(id).map(|st| (st.3, st.2)).unwrap_or((0, 0)),
+        None => (0, 0),
+    };
+    let idle_start = time::now_us();
+    if let Some(id) = opportunistic {
+        wait_until(
+            || matches!(tensor::stat(id).map(|st| st.3 >= st.2), Some(true)),
+            "the opportunistic job to finish on an idle device",
+        );
+    }
+    let idle_ms = (time::now_us() - idle_start) / 1000;
+
+    let (segments, refused, preemptions) = tensor::totals();
+    // The headline comparison: how long the interactive job waited, against
+    // how long the job it interrupted took in total. Without preemption it
+    // would have queued behind that.
+    let mut ui_latency_ms = 0;
+    let mut bg_latency_ms = 0;
+    tensor::for_each(|j| {
+        if j.qos == tensor::Qos::Interactive && j.state == tensor::JobState::Done {
+            ui_latency_ms = j.latency_us() / 1000;
+        }
+        if j.qos == tensor::Qos::Background && j.state == tensor::JobState::Done {
+            bg_latency_ms = j.latency_us() / 1000;
+        }
+    });
+
+    println!();
+    println!("   job  class          segs  done  latency  deadline   met  preempt   energy  state");
+    tensor::for_each(|j| {
+        let met = match j.met_deadline() {
+            Some(true) => "yes",
+            Some(false) => "NO",
+            None => "-",
+        };
+        let deadline_ms = match j.deadline_us {
+            Some(d) => (d.saturating_sub(j.submitted_us)) / 1000,
+            None => 0,
+        };
+        println!(
+            "  {:>4}  {:<13} {:>4}  {:>4}  {:>6}ms  {:>6}ms  {:>4}  {:>7}  {:>5} mJ  {}",
+            j.id,
+            j.qos.label(),
+            j.segments,
+            j.done_segments,
+            if j.state == tensor::JobState::Refused { 0 } else { j.latency_us() / 1000 },
+            deadline_ms,
+            met,
+            j.preemptions,
+            j.energy_uj / 1000,
+            j.state_label()
+        );
+    });
+
+    println!();
+    println!(
+        "  latency    : interactive waited {} ms; the background job it interrupted ran for {} ms",
+        ui_latency_ms, bg_latency_ms
+    );
+    println!(
+        "               without preemption the interactive job queues behind that and misses by {} ms",
+        bg_latency_ms.saturating_sub(50)
+    );
+    println!("  device     : {} segments executed, {} us each", segments, tensor::segment_cost_us());
+    println!("  preempted  : {} times — the background job gave way", preemptions);
+    println!("  refused    : {} job(s) whose deadline could not be met", refused);
+    println!(
+        "  opportunist: {} of {} segments while the device was wanted; the rest took {} ms once it was not",
+        opp_busy, opp_total, idle_ms
+    );
+
+    // The exit test in one line: did the interactive job land inside its
+    // deadline, and did it do so by taking the device off something else?
+    let mut interactive_met = false;
+    let mut background_preempted = false;
+    tensor::for_each(|j| {
+        if j.qos == tensor::Qos::Interactive && j.met_deadline() == Some(true) {
+            interactive_met = true;
+        }
+        if j.qos == tensor::Qos::Background && j.preemptions > 0 {
+            background_preempted = true;
+        }
+    });
+    let opportunistic_deferred = opp_busy < opp_total;
+    if interactive_met && background_preempted && refused > 0 && opportunistic_deferred {
+        println!("  RESULT     : PASS — interactive work preempted background and met its deadline,");
+        println!("               opportunistic work waited for an idle device, and work that could");
+        println!("               not be delivered was refused rather than accepted and missed");
+    } else {
+        println!(
+            "  RESULT     : FAIL — met {}, preempted {}, refused {}, deferred {}",
+            interactive_met, background_preempted, refused, opportunistic_deferred
+        );
+    }
 }
 
 fn current_el() -> u64 {

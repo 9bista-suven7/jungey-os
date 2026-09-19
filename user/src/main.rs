@@ -22,6 +22,8 @@ pub const ROLE_TRESPASSER: usize = 3;
 pub const ROLE_BLKDRV: usize = 4;
 pub const ROLE_MODEL_A: usize = 5;
 pub const ROLE_MODEL_B: usize = 6;
+pub const ROLE_INFER_UI: usize = 7;
+pub const ROLE_INFER_BG: usize = 8;
 
 /// Where a mapped model goes in our address space. High enough to be clear of
 /// the image and the heap, low enough to be obviously user memory.
@@ -57,6 +59,8 @@ pub extern "C" fn _start(role: usize) -> ! {
         ROLE_BLKDRV => blkdrv::run(),
         ROLE_MODEL_A => model_user("  [modelA  ]"),
         ROLE_MODEL_B => model_user("  [modelB  ]"),
+        ROLE_INFER_UI => infer_interactive(),
+        ROLE_INFER_BG => infer_background(),
         _ => write("user: unknown role\n"),
     }
     exit(0)
@@ -253,6 +257,84 @@ fn model_user(tag: &str) {
         .d(info[6] as usize)
         .s(" pages were reclaimed")
         .nl();
+}
+
+/// Report a finished job the way an application would see it.
+fn report_job(tag: &str, id: usize) {
+    let mut st = [0u64; 11];
+    if tensor_stat(id, &mut st) != 0 {
+        say(tag, " no such job");
+        return;
+    }
+    let mut l = Line::new();
+    l.s(tag)
+        .s(" job ")
+        .d(st[0] as usize)
+        .s(": ")
+        .d(st[3] as usize)
+        .s("/")
+        .d(st[2] as usize)
+        .s(" segments, latency ")
+        .d((st[4] / 1000) as usize)
+        .s(" ms");
+    if st[5] != 0 {
+        l.s(", deadline ").s(if st[6] == 1 { "MET" } else { "MISSED" });
+    }
+    l.s(", preempted ")
+        .d(st[7] as usize)
+        .s(" times, ")
+        .d((st[8] / 1000) as usize)
+        .s(" mJ")
+        .nl();
+}
+
+/// A long, patient job. Nobody is waiting on it, and it should be the one that
+/// gives way.
+fn infer_background() {
+    const TAG: &str = "  [infer-bg]";
+    say(TAG, " submitting 150 background segments, no deadline");
+    let id = tensor_submit(QOS_BACKGROUND, 150, 0);
+    if id < 0 {
+        say(TAG, " refused");
+        return;
+    }
+    if tensor_wait(id as usize, 3000) != 1 {
+        say(TAG, " did not finish in time");
+        return;
+    }
+    report_job(TAG, id as usize);
+}
+
+/// The user is waiting. Arrives after the background job is already running,
+/// and has 50 ms to be done.
+fn infer_interactive() {
+    const TAG: &str = "  [infer-ui]";
+
+    // Let the background job get hold of the device first, so this genuinely
+    // has to take it away rather than just finding it free.
+    sleep(5);
+
+    say(TAG, " submitting 5 interactive segments with a 50 ms deadline");
+    let id = tensor_submit(QOS_INTERACTIVE, 5, 50_000);
+    if id < 0 {
+        say(TAG, " refused — the deadline could not be met");
+        return;
+    }
+    if tensor_wait(id as usize, 500) != 1 {
+        say(TAG, " did not finish in time");
+        return;
+    }
+    report_job(TAG, id as usize);
+
+    // Now ask for something that cannot be delivered. A system that accepts
+    // this and misses is worse than one that says no.
+    say(TAG, " now asking for 400 segments within 20 ms");
+    let bad = tensor_submit(QOS_INTERACTIVE, 400, 20_000);
+    if bad < 0 {
+        say(TAG, " refused, as it should be — the app can pick a smaller model");
+    } else {
+        say(TAG, " BUG: accepted work it cannot finish in time");
+    }
 }
 
 fn errname(e: isize) -> &'static str {

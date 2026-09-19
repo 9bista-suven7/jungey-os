@@ -3,7 +3,7 @@
 # disk. Prints one line per check and exits non-zero if any of them fail.
 #
 #   ./test.sh            five boots: SMP, capabilities, block I/O, crash test,
-#                        userspace driver, shared model pages
+#                        userspace driver, shared model pages, tensor scheduling
 #   ./test.sh --repeat N  run the whole thing N times over, for flushing out
 #                         races that only show up occasionally
 set -uo pipefail
@@ -50,12 +50,17 @@ for round in $(seq 1 "$REPEAT"); do
     check "filesystem formatted"         1 "$LOG_DIR/boot1" "format     : superblock"
     check "driver runs in userspace"     1 "$LOG_DIR/boot1" "attached in userspace"
     check "driver holds five capabilities" 1 "$LOG_DIR/boot1" "holding 5 capabilities"
+    check "interactive met its deadline" 1 "$LOG_DIR/boot1" "deadline MET"
+    check "background gave way"          1 "$LOG_DIR/boot1" "the background job gave way"
+    check "undeliverable work refused"   1 "$LOG_DIR/boot1" "refused, as it should be — the app"
+    check "opportunistic waited"         1 "$LOG_DIR/boot1" "opportunistic work waited for an idle"
+    check "scheduler result"             1 "$LOG_DIR/boot1" "RESULT     : PASS — interactive work preempted"
     check "model file verified on disk"  1 "$LOG_DIR/boot1" "verified on disk"
     check "weights shared, not copied"   1 "$LOG_DIR/boot1" "one copy of the weights"
     check "reclaimed pages re-faulted"   2 "$LOG_DIR/boot1" "0 wrong after"
     check "no kernel panic"              0 "$LOG_DIR/boot1" "KERNEL PANIC"
     check "no wait timed out"            0 "$LOG_DIR/boot1" "TIMEOUT"
-    check "boot ran to completion"       1 "$LOG_DIR/boot1" "stage 5a complete"
+    check "boot ran to completion"       1 "$LOG_DIR/boot1" "stage 5b complete"
 
     echo "boot 2 — verify v1, then lose power part way through the data"
     check "sector survived the reboot"   1 "$LOG_DIR/boot2" "previous   : boot 1"
@@ -83,7 +88,8 @@ for round in $(seq 1 "$REPEAT"); do
     check "model survived the crashes"   1 "$LOG_DIR/boot5" "verified on disk"
     check "no kernel panic"              0 "$LOG_DIR/boot5" "KERNEL PANIC"
     check "no wait timed out"            0 "$LOG_DIR/boot5" "TIMEOUT"
-    check "boot ran to completion"       1 "$LOG_DIR/boot5" "stage 5a complete"
+    check "scheduler still correct"      1 "$LOG_DIR/boot5" "RESULT     : PASS — interactive work preempted"
+    check "boot ran to completion"       1 "$LOG_DIR/boot5" "stage 5b complete"
 done
 
 echo

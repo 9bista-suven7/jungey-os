@@ -9,7 +9,7 @@ use crate::mm::paging::Perm;
 use crate::mm::PAGE_SIZE;
 use crate::exceptions::TrapFrame;
 use crate::mm::uaccess;
-use crate::{gic, ipc, irq, model, proc, sched, time};
+use crate::{gic, ipc, irq, model, proc, sched, tensor, time};
 
 pub const SYS_EXIT: u64 = 0;
 pub const SYS_WRITE: u64 = 1;
@@ -25,6 +25,9 @@ pub const SYS_IRQ_WAIT: u64 = 10;
 pub const SYS_MODEL_OPEN: u64 = 11;
 pub const SYS_MODEL_MAP: u64 = 12;
 pub const SYS_MODEL_INFO: u64 = 13;
+pub const SYS_TENSOR_SUBMIT: u64 = 14;
+pub const SYS_TENSOR_WAIT: u64 = 15;
+pub const SYS_TENSOR_STAT: u64 = 16;
 
 pub const EBADCAP: isize = -1;
 pub const EPERM: isize = -2;
@@ -32,6 +35,8 @@ pub const EREVOKED: isize = -3;
 pub const EFAULT: isize = -4;
 pub const EINVAL: isize = -5;
 pub const ETIMEDOUT: isize = -6;
+/// The work cannot be finished before the deadline it asked for.
+pub const EDEADLINE: isize = -7;
 
 /// Called from the synchronous-exception path when a lower EL executes SVC.
 pub fn dispatch(frame: &mut TrapFrame) {
@@ -69,6 +74,9 @@ pub fn dispatch(frame: &mut TrapFrame) {
         SYS_MODEL_OPEN => sys_model_open(pid, a, b),
         SYS_MODEL_MAP => sys_model_map(pid, a as u64, b),
         SYS_MODEL_INFO => sys_model_info(pid, a as u64, b),
+        SYS_TENSOR_SUBMIT => sys_tensor_submit(pid, a as u64, b as u32, c as u64),
+        SYS_TENSOR_WAIT => sys_tensor_wait(a as u64, b as u64),
+        SYS_TENSOR_STAT => sys_tensor_stat(pid, a as u64, b),
         _ => EINVAL,
     };
 
@@ -315,6 +323,66 @@ fn sys_model_info(pid: usize, id: u64, out: usize) -> isize {
         st.7 as u64,
     ];
     let mut bytes = [0u8; 64];
+    for (i, v) in vals.iter().enumerate() {
+        bytes[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    match with_space(pid, |s| uaccess::copy_to_user(s, out, &bytes)) {
+        Some(Ok(())) => 0,
+        _ => EFAULT,
+    }
+}
+
+/// Offer inference work to the accelerator.
+///
+/// `deadline_us` of zero means "no deadline". A job that asks for one it cannot
+/// be given is refused here rather than accepted and missed later, which is the
+/// difference between an application that can fall back to a smaller model and
+/// one that just stutters.
+fn sys_tensor_submit(pid: usize, qos: u64, segments: u32, deadline_us: u64) -> isize {
+    if segments == 0 || segments > 100_000 {
+        return EINVAL;
+    }
+    let deadline = if deadline_us == 0 { None } else { Some(deadline_us) };
+    match tensor::submit(pid, tensor::Qos::from_u64(qos), segments, deadline) {
+        Ok(id) => id as isize,
+        Err(tensor::Reject::Undeliverable { needed_us, available_us }) => {
+            crate::println!(
+                "  tensor     : refused pid {} — needs {} us of device time, has {} us",
+                pid, needed_us, available_us
+            );
+            EDEADLINE
+        }
+    }
+}
+
+/// Wait for a job, up to `timeout` scheduler ticks. 1 if it finished.
+fn sys_tensor_wait(id: u64, timeout: u64) -> isize {
+    let deadline = time::ticks() + timeout.max(1);
+    loop {
+        match tensor::finished_or_prepare(id, tensor::token(id)) {
+            Some(true) => return 1,
+            Some(false) => return 0,
+            None => {}
+        }
+        if time::ticks() > deadline {
+            sched::cancel_block();
+            return ETIMEDOUT;
+        }
+        sched::block(tensor::token(id));
+    }
+}
+
+/// Write eleven u64s about a job: id, class, segments, done, latency us,
+/// deadline us, deadline met (1/0/2 for none), preemptions, energy uj,
+/// device us, state.
+fn sys_tensor_stat(pid: usize, id: u64, out: usize) -> isize {
+    let Some(st) = tensor::stat(id) else {
+        return EBADCAP;
+    };
+    let vals = [
+        st.0, st.1, st.2 as u64, st.3 as u64, st.4, st.5, st.6, st.7, st.8, st.9, st.10,
+    ];
+    let mut bytes = [0u8; 88];
     for (i, v) in vals.iter().enumerate() {
         bytes[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
     }

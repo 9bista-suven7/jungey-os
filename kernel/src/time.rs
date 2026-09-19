@@ -35,6 +35,19 @@ pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
+/// Microseconds since boot, from the cycle counter rather than the tick.
+///
+/// The scheduler tick is 10 ms, which is useless for saying whether a job met a
+/// 50 ms deadline. The generic timer counts at tens of megahertz and is the
+/// only clock here with the resolution to judge that.
+pub fn now_us() -> u64 {
+    let f = frequency();
+    if f == 0 {
+        return 0;
+    }
+    now() / (f / 1_000_000)
+}
+
 /// Milliseconds since `start`.
 pub fn uptime_ms() -> u64 {
     ticks() * 1000 / HZ

@@ -474,13 +474,61 @@ model file it had just written.
   needs a real access pattern to choose against.
 - *No KV cache tier yet* — that is 5c.
 
-### 5b — Tensor scheduler  ⬜
+### 5b — Tensor scheduler  ✅ *done*
 
-QoS classes, admission against a deadline, segment-level preemption, per-job
-accounting.
+Accelerator time as a scheduled resource. Four QoS classes, earliest-deadline
+first within a class, preemption at segment boundaries, admission control
+against a measured segment cost, and per-job latency and energy accounting.
 
 **Exit test:** a long background job is preempted mid-run by an interactive one
-that meets a 50 ms deadline, and both jobs' costs are attributed correctly.
+that meets a 50 ms deadline, and both jobs' costs are attributed correctly. ✅
+
+```
+   job  class          segs  done  latency  deadline   met  preempt   energy  state
+     1  foreground       4     4       1ms       0ms     -        0      3 mJ  done
+     2  opportunistic   20    20      89ms       0ms     -        0     17 mJ  done
+     3  background     150   150      80ms       0ms     -        1    175 mJ  done
+     4  interactive      5     5       2ms      50ms   yes        0      4 mJ  done
+     5  interactive    400     0       0ms      20ms     -        0      0 mJ  refused
+
+  latency    : interactive waited 2 ms; the background job it interrupted ran for 80 ms
+               without preemption the interactive job queues behind that and misses by 30 ms
+  preempted  : 1 times — the background job gave way
+  refused    : 1 job(s) whose deadline could not be met
+  opportunist: 1 of 20 segments while the device was wanted; the rest took 6 ms once it was not
+```
+
+That table is the whole argument in one place:
+
+- **2 ms against 80 ms.** The interactive job waited one segment, not one job.
+  On a device that serves requests in arrival order it waits behind the whole
+  background job and misses its deadline by 30 ms. This is the keyboard stutter,
+  and it is a scheduling problem with a scheduling answer.
+- **Refused, not missed.** 400 segments in 20 ms cannot be done, so it is
+  declined at submission. An application that is told no can fall back to a
+  smaller model; one that is told yes and then missed can only stutter.
+- **Opportunistic is elastic.** One segment while anything else wanted the
+  device, nineteen in 6 ms once nothing did.
+- **Costs land on the job that incurred them**, including the preemption count,
+  which is the thing an aggregate can never tell you.
+
+**What is real here and what is modelled**, because the distinction matters more
+than the numbers: the scheduling, admission control, preemption and accounting
+are real code making real decisions. The accelerator is not — there is no NPU in
+QEMU, so a segment is executed by a CPU loop and its cost is *measured* (≈360 µs
+here) rather than assumed, with the running average feeding admission decisions.
+Energy is that measured time times a fixed 2.5 W figure: a model, labelled as
+one. What is being tested is what the scheduler decides and when, and that does
+not change when the executor becomes silicon.
+
+**Deviations:**
+
+- *One device, one context.* Real parts have several engines and a DSP besides.
+  The queue is per-device already; making it per-engine is mechanical.
+- *Segments are uniform.* A real graph's segments vary by layer, and the cost
+  estimate should be per-segment rather than a device-wide average.
+- *No thermal input yet* — that is 5d, where energy stops being an output and
+  becomes an admission constraint.
 
 ### 5c — KV cache tier  ⬜
 

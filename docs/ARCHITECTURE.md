@@ -194,7 +194,13 @@ demand-paged from flash, shared page-for-page between processes, and reclaimed
 first under pressure because every resident page is clean. The KV-cache tier is
 the part of 3.2 still missing.
 
-Sections 3.1 and 3.5 do not exist yet — they are stages 5b and 5d. What stages 0-2
+Section 3.1 — the tensor scheduler — is built: QoS classes, earliest-deadline
+first within a class, preemption at segment boundaries, admission control
+against a measured segment cost, and per-job latency and energy accounting. The
+executor behind it is a CPU loop rather than an NPU, and says so.
+
+Section 3.5 does not exist yet — energy is accounted but not yet budgeted
+against, which is stage 5d. What stages 0-2
 buy is the substrate they need: address spaces to map weight pages into, a
 scheduler to extend with QoS classes, an interrupt path that will carry
 accelerator completions, and an authority model that an inference server can be

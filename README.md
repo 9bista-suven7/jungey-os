@@ -12,6 +12,12 @@ Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and
 
 ## Status
 
+**Stage 5b — inference is scheduled.** Accelerator time has QoS classes,
+deadlines it either accepts or refuses, and preemption at segment boundaries. An
+interactive job arriving while a 150-segment background job is running waits
+2 ms, not 80 ms, and meets a 50 ms deadline; work that cannot be delivered is
+declined at submission rather than accepted and missed.
+
 **Stage 5a — weights are a kernel object.** A model is content-addressed, so two
 processes opening the same bytes get one object and one copy of the pages;
 demand-paged, so mapping it is instant and pages arrive as they are touched; and
@@ -162,7 +168,16 @@ first; see `docs/ROADMAP.md` for those):
   reclaimed    : 8 of 16 pages dropped under pressure
   [modelA  ] pass 2: 128 bytes checked, 0 wrong after 8 pages were reclaimed
   ----------------------------------------------------------
-  stage 5a complete.
+   job  class          segs  done  latency  deadline   met  preempt   energy  state
+     2  opportunistic   20    20      89ms       0ms     -        0     17 mJ  done
+     3  background     150   150      80ms       0ms     -        1    175 mJ  done
+     4  interactive      5     5       2ms      50ms   yes        0      4 mJ  done
+     5  interactive    400     0       0ms      20ms     -        0      0 mJ  refused
+
+  latency    : interactive waited 2 ms; the background job it interrupted ran for 80 ms
+               without preemption the interactive job queues behind that and misses by 30 ms
+  ----------------------------------------------------------
+  stage 5b complete.
   powering off via psci.
 ```
 
@@ -231,6 +246,23 @@ Read that output as a set of claims, each of which fails loudly if broken:
   pressure, and both processes re-read them without noticing and without a
   single wrong byte.
 
+**Tensor scheduler (stage 5b)**
+
+- **2 ms, not 80 ms.** An interactive job preempts a running background one at
+  the next segment boundary. In arrival order it would wait behind the whole
+  job and miss its deadline by 30 ms.
+- **Undeliverable work is refused.** 400 segments in 20 ms is declined at
+  submission, so the application can choose a smaller model instead of
+  stuttering.
+- **Opportunistic work is elastic.** One segment while the device was wanted,
+  nineteen once it was not.
+- **Costs land on the job that incurred them**, preemption count included.
+
+The scheduling, admission control and accounting are real. The accelerator is
+not: there is no NPU in QEMU, so a segment runs on the CPU and its cost is
+measured rather than assumed, and energy is that measured time times a fixed
+power figure — a model, labelled as one in the source.
+
 The kernel powers off through PSCI when it finishes, so `./run.sh` returns
 rather than idling forever.
 
@@ -292,6 +324,7 @@ os/
         ├── blk.rs            block storage, as a client of a driver process
         ├── fs.rs             JLFS: append-only log, two checkpoint slots
         ├── model.rs          the model store: shared, paged, reclaimable weights
+        ├── tensor.rs         the tensor scheduler: QoS, deadlines, preemption
         ├── dtb.rs            flattened device tree reader
         ├── cap.rs            capabilities: minting, derivation, revocation
         ├── ipc.rs            channels and message queues
