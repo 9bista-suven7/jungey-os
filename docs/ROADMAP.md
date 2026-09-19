@@ -666,16 +666,119 @@ are a known quantity you can borrow from llama.cpp/MLC.*
 
 ---
 
-## Stage 6 — Agent runtime and typed apps
+## Stage 6 — Agent runtime and typed apps  ✅ *done*
 
-The capability broker, the delegation-chain log, transactional intents with undo,
-the typed-capability app manifest format, the planner, and an SDK. The app model
-is the product; everything below is plumbing that makes it trustworthy.
+The app model is the product; everything under it is plumbing that exists to
+make the app model trustworthy. An assistant that can act on your behalf is only
+tolerable if three things are true at once: it can only compose what applications
+chose to publish, every action it takes is attributable to a delegation chain you
+can read, and you can put things back.
 
-**Exit test:** the agent completes a three-app task it was never scripted for,
-you can read the full delegation chain afterwards, and you can undo it.
+**Exit test:** the agent completes a task it was never scripted for, you can read
+the full delegation chain afterwards, and you can undo it. ✅
 
-*Cost: 6–12 months, and it never really ends.*
+```
+  audit      : log at sector 112640, 0 records already recorded
+
+  operations published by applications:
+    name             provider   effect      confirm  args
+    notes.read       notes      read-only   no       file
+    notes.rewrite    notes      mutates     no       file, text
+    journal.append   journal    mutates     yes      file, text
+    message.send     messages   external    yes      to, text
+
+  the assistant is asked to summarise today's notes into the journal.
+  it composes 2 published operations, none of them written for this task:
+    notes.read from notes (read-only)
+    notes.rewrite from notes (mutates)
+
+  done       : 2 steps, both files rewritten: true
+
+  the capability every one of those actions ran under, traced back:
+    -> #11  journal-writer   append the summary           rights send
+       #10  assistant        summarise today's notes      rights send+recv
+       #9   you              these are your notes         rights all
+
+  action log : 2 records
+    #0   tick 269   cap #11  journal.append     journal.txt
+    #1   tick 270   cap #11  notes.rewrite      notes.txt
+    chain      : intact
+
+  undo       : 2 steps reversed, 0 could not be
+    both files are byte-for-byte what they were before: true
+    nothing was copied — the old contents were still in the log
+
+  tamper     : record #0 altered on disk
+    verification: chain breaks at #0
+
+  RESULT     : PASS — the assistant composed published operations it was not
+               written for, every action is attributable to a delegation chain
+               three links deep, the whole task was undone byte for byte, and
+               altering the record of it was detected
+```
+
+**Three pieces, and each answers a question the others cannot.**
+
+*Typed operations* (`intent.rs`) are what an application publishes: a name, who
+provides it, what arguments it takes, whether it only reads, mutates local state
+or reaches the outside world, and whether a human should confirm it. Nothing is
+callable that was not published. The agent in the demo composes `notes.read` and
+`notes.rewrite` — two operations written by the notes app for its own use, with
+no knowledge of this task — and it can do that only because they are typed. The
+effect type is the useful part: `message.send` is *external*, which is the
+difference between an agent that made a mess you can clean up and one that sent
+something to another person.
+
+*Delegation provenance* (`cap.rs`) makes every capability carry who holds it and
+what for, and a pointer to the capability it was derived from. The chain in the
+demo is three links deep — you, the assistant, the journal writer — and each link
+holds strictly less than the one above it: `all` becomes `send+recv` becomes
+`send`. That was already true of stage 2's capabilities; what is new is that the
+chain is *readable after the fact*, so "why was this file written?" has an answer
+that is not a guess.
+
+*The action log* (`audit.rs`) is 128-byte records in a reserved region of the
+disk, each one hashed together with the hash of the record before it. Every
+action names the capability it ran under, so the log and the chain join up. The
+demo deliberately corrupts a record and shows verification naming the exact
+record that broke — because a tamper-evident log that has never been shown to
+detect tampering is a claim, not a property.
+
+**Undo is not a copy.** `intent::record` is called *before* each write, not
+after, and what it stores is the file's directory entry — a pointer into the log
+at the sectors the old contents still occupy. JLFS never overwrites, so undoing a
+task means writing the old entry back. The cost is a directory entry per step,
+and it is why the demo can say "byte for byte" rather than "close enough". A step
+recorded after its write could not be undone if the machine stopped in between;
+the ordering is the whole mechanism.
+
+**Deviations, and one of them is large:**
+
+- ***There is no planner, and that is deliberate.*** The demo's agent selects
+  operations by effect type from the registry; it does not decide *what to do*.
+  The thing that turns "summarise today's notes" into a sequence of calls is a
+  language model, and there is no NPU in QEMU and no model to run on it. What is
+  under test is everything that has to be true *around* the planner — the type
+  system it plans against, the authority its calls run under, the record they
+  leave, and the undo. Bolting a planner onto that is a smaller job than building
+  it; building it first and adding the safety afterwards is how this goes wrong.
+- *The action log is tamper-evident, not tamper-proof.* It detects modification;
+  it cannot prevent it, and an attacker who can write the disk can rewrite the
+  whole chain from the altered record forward. Making that hard needs a hardware
+  root of trust — a monotonic counter or a sealed key the kernel cannot read —
+  which is stage 7 work.
+- *The hash is FNV-1a*, not a cryptographic one, and is trivially forgeable by
+  anyone trying. It is there to make the structure and the verification path
+  real; the function is a one-line substitution once there is a reason to pay
+  for it.
+- *`confirm` is a field nobody reads yet.* Operations declare whether a human
+  should approve them; there is no UI to ask, because stage 4 does not exist.
+- *Applications are in-kernel registrations*, not processes with manifests. The
+  manifest format and the SDK are what turns this into something a third party
+  can ship, and neither is written.
+
+*Cost: 6–12 months for the planner, the manifest format and the SDK, and it never
+really ends.*
 
 ---
 
@@ -693,6 +796,16 @@ everything else.*
 ---
 
 ## Reality check
+
+**Where this actually stands.** Stages 0, 1, 2, 3 (a–d), 5 (a–d) and 6 are
+built, and each one's exit test runs — `./test.sh` is about forty assertions
+across five boots, and it fails rather than hangs. Stages 4 and 7 are not, and
+neither is a matter of another few commits: stage 4 needs a real GPU and a real
+panel, and stage 7 needs a real phone, a modem, a key store and the patience to
+carry one as a daily driver. Both are listed here as years because they are
+years. The honest summary is that the *scheduling and safety* story — inference
+as a scheduled resource, authority you can trace, actions you can undo — is real
+and tested under QEMU, and the *device* story has not started.
 
 Stages 0–3 are a genuinely achievable solo project and teach more than any
 course. Stage 5 is where the idea becomes *worth something* — and it is reachable

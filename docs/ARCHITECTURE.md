@@ -169,43 +169,61 @@ the inference server and an app is a capability transfer, not a copy.
 
 ## 7. Current state
 
-Stages 0 through 3 are implemented: the kernel boots,
-runs in the higher half with the MMU on, allocates physical and heap memory,
-takes interrupts through a GICv3, preemptively schedules kernel threads off the
-generic timer, and runs isolated EL0 processes whose entire authority is the
-capabilities in their tables, across all four cores of the machine, and stores files on a
+Stages 0 through 3 are implemented: the kernel boots, runs in the higher half
+with the MMU on, allocates physical and heap memory, takes interrupts through a
+GICv3, preemptively schedules kernel threads off the generic timer, and runs
+isolated EL0 processes whose entire authority is the capabilities in their
+tables, across all four cores of the machine, and stores files on a
 log-structured filesystem that survives having its power cut mid-write — over a
 disk driven by a userspace process holding five capabilities and nothing else.
 
-Section 3.3 — the capability broker — has its foundation in place. `cap.rs`
-implements minting, derivation that can only narrow rights, and subtree
-revocation over a ledger that stays walkable after the ancestors are gone. The
-delegation chains of stage 6 (user → agent → tool → resource) are that
-structure with provenance recorded per edge, and revoking an agent's authority
-is the `revoke` that already exists.
+**Section 3.1 — the tensor scheduler — is built.** QoS classes, earliest-deadline
+first within a class, preemption at segment boundaries, admission control against
+a measured segment cost, and per-job latency and energy accounting. The executor
+behind it is a CPU loop rather than an NPU, and says so.
 
-Section 3.3's other half — the tamper-evident log of what an agent did, and
-transactional intents that can be undone — now has something to be built on:
-JLFS commits by switching a root atomically, which is the same primitive an
-undoable action log needs.
-
-Section 3.2 — the model store — is built: content-addressed weight objects,
+**Section 3.2 — the model store — is built.** Content-addressed weight objects,
 demand-paged from flash, shared page-for-page between processes, and reclaimed
-first under pressure because every resident page is clean. The KV-cache tier is
-the part of 3.2 still missing.
+first under pressure because every resident page is clean. The KV-cache tier
+exists too: entries are scored by age and position, evicted under pressure, and
+spilled to a reserved region of the disk rather than dropped.
 
-Section 3.1 — the tensor scheduler — is built: QoS classes, earliest-deadline
-first within a class, preemption at segment boundaries, admission control
-against a measured segment cost, and per-job latency and energy accounting. The
-executor behind it is a CPU loop rather than an NPU, and says so.
+**Section 3.3 — the capability broker — is built.** `cap.rs` does minting,
+derivation that can only narrow rights, and subtree revocation over a ledger that
+stays walkable after the ancestors are gone; each edge now records who holds the
+capability and what for, so the chain user → agent → tool is readable after the
+fact rather than only enforceable at the time. Its other half is built as well:
+`audit.rs` is a hash-chained action log in a reserved disk region, where each
+record names the capability its action ran under, and `intent.rs` groups mutating
+actions into intents that can be undone — using JLFS's never-overwrite property,
+so undo restores the previous contents rather than a copy of them. The log is
+tamper-*evident*: it detects modification and cannot prevent it, which needs a
+hardware root of trust and is stage 7.
 
-A display driver now exists alongside the block driver, holding the same five
+**Section 3.4 — typed capability apps — is built as far as it can be here.**
+Applications publish operations with a provider, typed arguments, an effect class
+(read-only, mutates, external) and whether a human should confirm, and the agent
+composes only what was published. The part that is missing is the planner — the
+language model that turns a request into a sequence of those calls — because
+there is no accelerator under QEMU to run one on. The type system it would plan
+against, the authority its calls run under, the record they leave and the undo
+are all here and tested; the planner is the piece that plugs into them.
+
+**Section 3.5 — energy-aware scheduling — is built.** Temperature is an
+admission input rather than a governor reacting afterwards: between the throttle
+point and critical, background and opportunistic work is turned away while
+interactive work still runs, and jobs can declare an energy cap that binds
+mid-flight.
+
+A display driver exists alongside the block driver, holding the same five
 capabilities and reaching nothing else — evidence that the driver framework is a
-framework rather than one device's scaffolding.
+framework rather than one device's scaffolding. It is a framebuffer and a bitmap
+font, not the display server of stage 4: no compositor, no input, no windows.
 
-Section 3.5 does not exist yet — energy is accounted but not yet budgeted
-against, which is stage 5d. What stages 0-2
-buy is the substrate they need: address spaces to map weight pages into, a
-scheduler to extend with QoS classes, an interrupt path that will carry
-accelerator completions, and an authority model that an inference server can be
-held to. See `ROADMAP.md` for what each stage delivers and what it costs.
+**What is not here:** stage 4 (a real display server, GPU bring-up, touch input,
+a shell) and stage 7 (power management, suspend/resume, verified boot, OTA with
+A/B slots, modem, and the long tail of thermals and reliability on real
+silicon). Neither is a few commits away; both are the years `ROADMAP.md` says
+they are. Everything above runs under QEMU on emulated hardware, which is the
+right place to prove a scheduling and authority model and the wrong place to
+claim a device.

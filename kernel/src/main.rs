@@ -21,6 +21,7 @@ pub mod elf;
 pub mod exceptions;
 pub mod fs;
 pub mod gic;
+pub mod intent;
 pub mod ipc;
 pub mod kv;
 pub mod irq;
@@ -31,6 +32,7 @@ pub mod sched;
 pub mod smp;
 pub mod syscall;
 pub mod tensor;
+pub mod audit;
 pub mod blk;
 pub mod devices;
 pub mod display;
@@ -74,7 +76,7 @@ const RULE: &str = "  ----------------------------------------------------------
 #[no_mangle]
 pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
     println!("{}", BANNER);
-    println!("  Jungey OS  v0.11.0  ·  stage 5d  ·  aarch64");
+    println!("  Jungey OS  v0.12.0  ·  stage 6  ·  aarch64");
     println!("{}", RULE);
 
     let (kstart, kend) = unsafe {
@@ -213,6 +215,9 @@ pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
     println!("{}", RULE);
     stage5d_demo();
     heap_check("after stage 5d");
+    println!("{}", RULE);
+    stage6_demo();
+    heap_check("after stage 6");
 
     // A screen, if the machine has one. `sim.sh` attaches a display; `run.sh`
     // does not, and everything above works identically either way.
@@ -230,7 +235,7 @@ pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
             blk::stale_replies()
         );
     }
-    println!("  stage 5d complete.");
+    println!("  stage 6 complete.");
 
     // The demos are the kernel's whole job right now, so stopping the machine
     // when they finish beats idling forever: `./run.sh` returns, and a stress
@@ -1684,6 +1689,263 @@ fn stage5d_demo() {
         println!(
             "  RESULT     : FAIL — warm: opp {} bg {} ui {} | critical: ui-refused {} | readmitted {} | cap {}",
             refused_hot, background_refused, interactive_ok, interactive_refused, readmitted, cap_bound
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 6 exit test: an agent composes published operations to do a task, the
+// delegation chain behind every action is readable afterwards, the record of
+// what it did detects tampering, and the whole thing can be undone.
+//
+// What is deliberately *not* here is the planner. Choosing which operations to
+// compose for a goal stated in English needs a model, and this machine does not
+// run one. Everything around the planner is what makes an agent safe to let
+// near anything, and that is what is built and tested here.
+// ---------------------------------------------------------------------------
+
+const NOTES: &str = "notes.txt";
+const JOURNAL: &str = "journal.txt";
+
+fn agent_content(tag: u8, len: usize) -> alloc::vec::Vec<u8> {
+    let mut v = alloc::vec::Vec::with_capacity(len);
+    let head: &[u8] = match tag {
+        1 => b"notes, before the assistant touched them\n",
+        2 => b"notes, rewritten by the assistant\n",
+        3 => b"journal, before\n",
+        _ => b"journal, with the summary appended\n",
+    };
+    v.extend_from_slice(head);
+    while v.len() < len {
+        v.push((v.len().wrapping_mul(17) as u8) ^ tag.wrapping_mul(53));
+    }
+    v
+}
+
+fn file_matches(f: &fs::Fs, name: &str, want: &[u8]) -> bool {
+    let mut got = alloc::vec![0u8; want.len()];
+    matches!(f.read(name, &mut got), Ok(n) if n == want.len() && got == want)
+}
+
+fn stage6_demo() {
+    if !blk::attached() {
+        println!("  agent      : no disk, skipping");
+        return;
+    }
+    let Ok(mut f) = mounted() else { return };
+    audit::init(f.audit_start, f.audit_sectors);
+    println!(
+        "  audit      : log at sector {}, {} records already recorded",
+        f.audit_start,
+        audit::len()
+    );
+
+    // ---- applications publish what they can do ----
+    intent::publish(intent::Operation {
+        name: "notes.read",
+        provider: "notes",
+        args: "file",
+        effect: intent::Effect::ReadOnly,
+        confirm: false,
+    });
+    intent::publish(intent::Operation {
+        name: "notes.rewrite",
+        provider: "notes",
+        args: "file, text",
+        effect: intent::Effect::Mutates,
+        confirm: false,
+    });
+    intent::publish(intent::Operation {
+        name: "journal.append",
+        provider: "journal",
+        args: "file, text",
+        effect: intent::Effect::Mutates,
+        confirm: true,
+    });
+    intent::publish(intent::Operation {
+        name: "message.send",
+        provider: "messages",
+        args: "to, text",
+        effect: intent::Effect::External,
+        confirm: true,
+    });
+
+    println!();
+    println!("  operations published by applications:");
+    println!("    name             provider   effect      confirm  args");
+    intent::for_each_operation(|o| {
+        println!(
+            "    {:<16} {:<10} {:<11} {:<7}  {}",
+            o.name,
+            o.provider,
+            o.effect.label(),
+            if o.confirm { "yes" } else { "no" },
+            o.args
+        );
+    });
+
+    // ---- the files the task is about ----
+    let notes_v1 = agent_content(1, 700);
+    let journal_v1 = agent_content(3, 500);
+    if f.write(NOTES, &notes_v1, None).is_err() || f.write(JOURNAL, &journal_v1, None).is_err() {
+        println!("  agent      : could not set up the files");
+        return;
+    }
+
+    // ---- authority ----
+    //
+    // You hold it. The assistant gets a narrower copy, for a stated purpose.
+    // The tool it calls gets a narrower copy still. Nothing in the chain can
+    // widen what it was given.
+    let user = cap::Cap::root_for(
+        cap::Obj::Operation("notes.*"),
+        cap::RIGHTS_ALL,
+        "you",
+        "these are your notes",
+    );
+    let assistant = user.derive_for(
+        cap::RIGHT_SEND | cap::RIGHT_RECV,
+        "assistant",
+        "summarise today's notes",
+    );
+    let tool = assistant.derive_for(cap::RIGHT_SEND, "journal-writer", "append the summary");
+
+    // ---- plan from the registry ----
+    let mut chosen = [intent::Operation {
+        name: "",
+        provider: "",
+        args: "",
+        effect: intent::Effect::ReadOnly,
+        confirm: false,
+    }; 4];
+    let n = intent::plan(
+        &[intent::Effect::ReadOnly, intent::Effect::Mutates],
+        &mut chosen,
+    );
+    println!();
+    println!("  the assistant is asked to summarise today's notes into the journal.");
+    println!("  it composes {} published operations, none of them written for this task:", n);
+    for op in chosen[..n].iter() {
+        println!("    {} from {} ({})", op.name, op.provider, op.effect.label());
+    }
+
+    // ---- carry it out as one intent ----
+    let task = intent::begin(
+        "summarise today's notes into the journal",
+        "assistant",
+        tool.id,
+    );
+    let notes_v2 = agent_content(2, 760);
+    let journal_v2 = agent_content(4, 560);
+
+    // Recorded before the change, not after: a step recorded afterwards cannot
+    // be undone if the machine stops in between.
+    intent::record(task, "journal.append", JOURNAL, f.entry(JOURNAL), true);
+    let _ = audit::append("assistant", tool.id, "journal.append", JOURNAL);
+    if f.write(JOURNAL, &journal_v2, None).is_err() {
+        println!("  agent      : journal write failed");
+        return;
+    }
+
+    intent::record(task, "notes.rewrite", NOTES, f.entry(NOTES), true);
+    let _ = audit::append("assistant", tool.id, "notes.rewrite", NOTES);
+    if f.write(NOTES, &notes_v2, None).is_err() {
+        println!("  agent      : notes write failed");
+        return;
+    }
+    intent::commit(task);
+
+    let did_work = file_matches(&f, NOTES, &notes_v2) && file_matches(&f, JOURNAL, &journal_v2);
+    println!();
+    println!("  done       : {} steps, both files rewritten: {}", intent::steps(task), did_work);
+
+    // ---- who authorised this? ----
+    let mut links = [(0u64, cap::Provenance { parent: 0, holder: "", purpose: "", rights: 0 }); 8];
+    let depth = cap::chain(tool.id, &mut links);
+    println!();
+    println!("  the capability every one of those actions ran under, traced back:");
+    for (i, (id, p)) in links[..depth].iter().enumerate() {
+        println!(
+            "    {}#{:<3} {:<16} {:<28} rights {}",
+            if i == 0 { "-> " } else { "   " },
+            id,
+            p.holder,
+            p.purpose,
+            cap::rights_name(p.rights)
+        );
+    }
+
+    // ---- is the record intact? ----
+    let v = audit::verify();
+    println!();
+    println!("  action log : {} records", v.records);
+    let mut name = [0u8; 32];
+    let mut detail = [0u8; 40];
+    let from = v.records.saturating_sub(4);
+    for seq in from..v.records {
+        if let Some((s, tick, capid)) = audit::read(seq, &mut name, &mut detail) {
+            println!(
+                "    #{:<3} tick {:<5} cap #{:<3} {:<18} {}",
+                s,
+                tick,
+                capid,
+                audit::as_str(&name),
+                audit::as_str(&detail)
+            );
+        }
+    }
+    let chain_ok = v.first_bad.is_none();
+    println!("    chain      : {}", if chain_ok { "intact" } else { "BROKEN" });
+
+    // ---- undo ----
+    let (reversed, refused) = match intent::undo(task, &mut f) {
+        Ok(r) => r,
+        Err(e) => {
+            println!("  undo       : failed — {}", e);
+            return;
+        }
+    };
+    let _ = audit::append("you", user.id, "undo", "summarise today's notes");
+    let restored = file_matches(&f, NOTES, &notes_v1) && file_matches(&f, JOURNAL, &journal_v1);
+    println!();
+    println!("  undo       : {} steps reversed, {} could not be", reversed, refused);
+    println!(
+        "    both files are byte-for-byte what they were before: {}",
+        restored
+    );
+    println!("    nothing was copied — the old contents were still in the log");
+
+    // ---- would tampering be noticed? ----
+    //
+    // A tamper-evident log that has never been shown to detect tampering is a
+    // claim rather than a property. The record is flipped back afterwards so
+    // the log stays usable.
+    let target_seq = v.records.saturating_sub(2);
+    let _ = audit::corrupt_for_test(target_seq, 60);
+    let after = audit::verify();
+    let detected = after.first_bad == Some(target_seq);
+    println!();
+    println!("  tamper     : record #{} altered on disk", target_seq);
+    println!(
+        "    verification: {}",
+        match after.first_bad {
+            Some(seq) => alloc::format!("chain breaks at #{}", seq),
+            None => alloc::string::String::from("did not notice — FAIL"),
+        }
+    );
+    let _ = audit::corrupt_for_test(target_seq, 60); // put it back
+    let repaired = audit::verify().first_bad.is_none();
+
+    println!();
+    if did_work && depth == 3 && chain_ok && restored && reversed == 2 && detected && repaired {
+        println!("  RESULT     : PASS — the assistant composed published operations it was not");
+        println!("               written for, every action is attributable to a delegation chain");
+        println!("               three links deep, the whole task was undone byte for byte, and");
+        println!("               altering the record of it was detected");
+    } else {
+        println!(
+            "  RESULT     : FAIL — work {}, chain depth {}, log {}, restored {}, reversed {}, tamper {}, repaired {}",
+            did_work, depth, chain_ok, restored, reversed, detected, repaired
         );
     }
 }

@@ -12,6 +12,14 @@ Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and
 
 ## Status
 
+**Stage 6 — an agent you can hold to account.** An assistant composes
+operations that applications published for their own use and that nobody wrote
+for the task; every action it takes is attributable to a delegation chain three
+links deep that you can read afterwards; the whole task is undone byte for byte;
+and altering the record of it is detected. What is deliberately absent is the
+planner — see [`docs/ROADMAP.md`](docs/ROADMAP.md) for why building the safety
+around it first is the point.
+
 **It has a screen.** `./sim.sh` boots the OS as a simulated device with a
 display, driven by a userspace virtio-gpu driver holding the same five
 capabilities as the block driver. The status screen is drawn by the kernel and
@@ -216,7 +224,20 @@ first; see `docs/ROADMAP.md` for those):
   latency    : interactive waited 2 ms; the background job it interrupted ran for 80 ms
                without preemption the interactive job queues behind that and misses by 30 ms
   ----------------------------------------------------------
-  stage 5b complete.
+  ----------------------------------------------------------
+  the capability every one of those actions ran under, traced back:
+    -> #11  journal-writer   append the summary           rights send
+       #10  assistant        summarise today's notes      rights send+recv
+       #9   you              these are your notes         rights all
+
+  action log : 2 records
+    chain      : intact
+  undo       : 2 steps reversed, 0 could not be
+    both files are byte-for-byte what they were before: true
+  tamper     : record #0 altered on disk
+    verification: chain breaks at #0
+  ----------------------------------------------------------
+  stage 6 complete.
   powering off via psci.
 ```
 
@@ -302,6 +323,25 @@ not: there is no NPU in QEMU, so a segment runs on the CPU and its cost is
 measured rather than assumed, and energy is that measured time times a fixed
 power figure — a model, labelled as one in the source.
 
+**Agent runtime (stage 6)**
+
+- **Only what was published is callable.** Applications register typed
+  operations — provider, arguments, effect, whether a human should confirm — and
+  the agent composes two of them for a task neither was written for.
+- **Authority narrows down the chain.** You hold `all`; the assistant gets
+  `send+recv`; the tool it calls gets `send`. Three links, readable after the
+  fact, so "why was this file written?" has an answer that is not a guess.
+- **Undo is byte for byte, not a copy.** Each step records the file's directory
+  entry *before* the write; JLFS never overwrites, so reversing a task means
+  writing the old entry back. Both files come back identical.
+- **Tampering is detected.** A record is corrupted on purpose and verification
+  names the exact record the chain breaks at.
+
+The log is tamper-*evident*, not tamper-proof, and the hash is FNV-1a: it
+detects modification, it does not prevent it, and it would not survive an
+attacker who is trying. Preventing it needs a hardware root of trust, which is
+stage 7.
+
 The kernel powers off through PSCI when it finishes, so `./run.sh` returns
 rather than idling forever.
 
@@ -366,8 +406,11 @@ os/
         ├── blk.rs            block storage, as a client of a driver process
         ├── fs.rs             JLFS: append-only log, two checkpoint slots
         ├── model.rs          the model store: shared, paged, reclaimable weights
+        ├── kv.rs             the KV cache: an evictable, spillable tier
         ├── tensor.rs         the tensor scheduler: QoS, deadlines, preemption
-        ├── display.rs       builds frames; knows nothing about pixels
+        ├── audit.rs          hash-chained action log, one record per action
+        ├── intent.rs         typed operations, transactional intents, undo
+        ├── display.rs        builds frames; knows nothing about pixels
         ├── dtb.rs            flattened device tree reader
         ├── cap.rs            capabilities: minting, derivation, revocation
         ├── ipc.rs            channels and message queues

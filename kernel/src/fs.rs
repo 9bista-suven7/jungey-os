@@ -41,6 +41,13 @@ const SB_SECTOR: u64 = 0;
 /// — is exactly the assumption that had an earlier version of this project
 /// quietly overwriting its own model file.
 const SPILL_SECTORS: u64 = 16 * 1024; // 8 MiB
+
+/// Sectors reserved for the agent's action log, below the spill region.
+///
+/// Its own region for the same reason the spill area has one: a log that
+/// records what an agent did is worthless if the thing it is auditing can grow
+/// over it.
+const AUDIT_SECTORS: u64 = 2048; // 1 MiB
 const CP_SECTORS: [u64; 2] = [1, 2];
 pub const TEST_STATE_SECTOR: u64 = 4;
 const LOG_START: u64 = 8;
@@ -185,6 +192,8 @@ pub struct Fs {
     /// First sector of the reserved spill region: the log stops here.
     pub spill_start: u64,
     pub spill_sectors: u64,
+    pub audit_start: u64,
+    pub audit_sectors: u64,
     /// Which checkpoint slot the live root is in. The next commit writes the
     /// other one, so a torn write can never damage the root we booted from.
     pub slot: usize,
@@ -198,10 +207,13 @@ pub fn format(total_sectors: u64) -> Result<(), &'static str> {
     put_u32(&mut sb, 8, 1); // version
     put_u64(&mut sb, 12, total_sectors);
     let spill_start = total_sectors - SPILL_SECTORS;
+    let audit_start = spill_start - AUDIT_SECTORS;
     put_u64(&mut sb, 20, LOG_START);
-    put_u64(&mut sb, 28, spill_start - LOG_START);
+    put_u64(&mut sb, 28, audit_start - LOG_START);
     put_u64(&mut sb, 36, spill_start);
     put_u64(&mut sb, 44, SPILL_SECTORS);
+    put_u64(&mut sb, 52, audit_start);
+    put_u64(&mut sb, 60, AUDIT_SECTORS);
     seal(&mut sb);
     blk::write_sector(SB_SECTOR, &sb)?;
 
@@ -210,6 +222,11 @@ pub fn format(total_sectors: u64) -> Result<(), &'static str> {
     let blank = [0u8; SECTOR_SIZE];
     blk::write_sector(CP_SECTORS[1], &blank)?;
     blk::write_sector(CP_SECTORS[0], &Checkpoint::new().encode())?;
+
+    // Start the action log empty. Its scan stops at the first unwritten slot,
+    // so clearing the first sector is enough — and leaving stale records from a
+    // previous filesystem would have the new one's log start mid-chain.
+    blk::write_sector(audit_start, &blank)?;
     Ok(())
 }
 
@@ -226,6 +243,8 @@ pub fn mount() -> Result<Fs, &'static str> {
     let total_sectors = get_u64(&sb, 12);
     let spill_start = get_u64(&sb, 36);
     let spill_sectors = get_u64(&sb, 44);
+    let audit_start = get_u64(&sb, 52);
+    let audit_sectors = get_u64(&sb, 60);
 
     let mut best: Option<(usize, Checkpoint)> = None;
     for (i, &sector) in CP_SECTORS.iter().enumerate() {
@@ -242,7 +261,7 @@ pub fn mount() -> Result<Fs, &'static str> {
     }
 
     let (slot, cp) = best.ok_or("no valid checkpoint: filesystem is unrecoverable")?;
-    Ok(Fs { cp, slot, total_sectors, spill_start, spill_sectors })
+    Ok(Fs { cp, slot, total_sectors, spill_start, spill_sectors, audit_start, audit_sectors })
 }
 
 impl Fs {
@@ -293,9 +312,9 @@ impl Fs {
         }
         let sectors = data.len().div_ceil(SECTOR_SIZE) as u32;
         let start = self.cp.log_head;
-        // The log stops at the spill region rather than at the end of the
-        // disk: another subsystem owns those sectors.
-        if start + sectors as u64 > self.spill_start {
+        // The log stops at the reserved regions rather than at the end of the
+        // disk: other subsystems own those sectors.
+        if start + sectors as u64 > self.audit_start {
             return Err("log is full");
         }
 
@@ -353,6 +372,53 @@ impl Fs {
         self.cp = next;
         self.slot = target;
         Ok(())
+    }
+
+    /// Replace or remove a directory entry, committing a new checkpoint.
+    ///
+    /// This is what makes undo cheap. A log-structured filesystem never
+    /// overwrites, so the bytes a file used to contain are still on the disk
+    /// after it is rewritten — putting the old entry back is a metadata
+    /// operation, not a copy. The absence of a cleaner, which is a shortcoming
+    /// everywhere else, is what buys it here.
+    pub fn set_entry(&mut self, name: &str, entry: Option<FileEntry>) -> Result<(), &'static str> {
+        let mut next = Checkpoint {
+            seq: self.cp.seq + 1,
+            log_head: self.cp.log_head,
+            files: self.cp.files,
+            count: self.cp.count,
+        };
+        let at = self.find(name);
+        match (at, entry) {
+            (Some(i), Some(e)) => next.files[i] = e,
+            (Some(i), None) => {
+                // Remove by shifting the tail down; order is not meaningful.
+                for j in i..next.count - 1 {
+                    next.files[j] = next.files[j + 1];
+                }
+                next.count -= 1;
+                next.files[next.count] = FileEntry::empty();
+            }
+            (None, Some(e)) => {
+                if next.count == MAX_FILES {
+                    return Err("directory is full");
+                }
+                next.files[next.count] = e;
+                next.count += 1;
+            }
+            (None, None) => return Ok(()),
+        }
+
+        let target = 1 - self.slot;
+        blk::write_sector(CP_SECTORS[target], &next.encode())?;
+        self.cp = next;
+        self.slot = target;
+        Ok(())
+    }
+
+    /// The directory entry for `name`, if it exists.
+    pub fn entry(&self, name: &str) -> Option<FileEntry> {
+        self.find(name).map(|i| self.cp.files[i])
     }
 
     /// Sectors of log in use, and how much of that is garbage left by rewrites.

@@ -68,6 +68,12 @@ for round in $(seq 1 "$REPEAT"); do
     check "thermal refuses background"   1 "$LOG_DIR/boot1" "background work        REFUSED"
     check "interactive still admitted"   1 "$LOG_DIR/boot1" "RESULT     : PASS — past the throttle point"
     check "energy cap binds"             1 "$LOG_DIR/boot1" "energy cap : 40 segments"
+    check "agent composed operations"    1 "$LOG_DIR/boot1" "published operations it was not"
+    check "delegation chain readable"    1 "$LOG_DIR/boot1" "journal-writer"
+    check "action log intact"            1 "$LOG_DIR/boot1" "chain      : intact"
+    check "task undone byte for byte"    1 "$LOG_DIR/boot1" "byte-for-byte what they were before: true"
+    check "tampering detected"           1 "$LOG_DIR/boot1" "chain breaks at"
+    check "agent runtime result"         1 "$LOG_DIR/boot1" "RESULT     : PASS — the assistant composed"
     check "kv survived the flash trip"   1 "$LOG_DIR/boot1" "every byte survived the round trip"
     check "kv policy correct"            1 "$LOG_DIR/boot1" "RESULT     : PASS — the budget held"
     check "model file verified on disk"  1 "$LOG_DIR/boot1" "verified on disk"
@@ -75,7 +81,7 @@ for round in $(seq 1 "$REPEAT"); do
     check "reclaimed pages re-faulted"   2 "$LOG_DIR/boot1" "0 wrong after"
     check "no kernel panic"              0 "$LOG_DIR/boot1" "KERNEL PANIC"
     check "no wait timed out"            0 "$LOG_DIR/boot1" "TIMEOUT"
-    check "boot ran to completion"       1 "$LOG_DIR/boot1" "stage 5d complete"
+    check "boot ran to completion"       1 "$LOG_DIR/boot1" "stage 6 complete"
 
     echo "boot 2 — verify v1, then lose power part way through the data"
     check "sector survived the reboot"   1 "$LOG_DIR/boot2" "previous   : boot 1"
@@ -104,7 +110,7 @@ for round in $(seq 1 "$REPEAT"); do
     check "no kernel panic"              0 "$LOG_DIR/boot5" "KERNEL PANIC"
     check "no wait timed out"            0 "$LOG_DIR/boot5" "TIMEOUT"
     check "scheduler still correct"      1 "$LOG_DIR/boot5" "RESULT     : PASS — interactive work preempted"
-    check "boot ran to completion"       1 "$LOG_DIR/boot5" "stage 5d complete"
+    check "boot ran to completion"       1 "$LOG_DIR/boot5" "stage 6 complete"
 done
 
 echo

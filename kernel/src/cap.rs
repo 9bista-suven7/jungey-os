@@ -45,6 +45,9 @@ pub enum Obj {
     Irq(u32),
     /// Physically contiguous memory a device can be pointed at.
     Dma { base: usize, pages: usize },
+    /// The right to invoke a published operation. What an agent is given, and
+    /// the thing a delegation chain usually ends at.
+    Operation(&'static str),
 }
 
 #[derive(Clone, Copy)]
@@ -57,34 +60,91 @@ pub struct Cap {
     /// Tombstoned rather than removed: a revoked capability must be
     /// distinguishable from one that was never granted.
     pub revoked: bool,
+    /// Who this was derived *for*, and *why*.
+    ///
+    /// Rights say what a capability permits. Provenance says how it came to
+    /// exist, and that is the question anyone actually asks afterwards: not
+    /// "could the assistant delete that file" but "on whose authority, and for
+    /// what". Without it a capability tree is a set of permissions with no
+    /// account of how they were granted.
+    pub holder: &'static str,
+    pub purpose: &'static str,
 }
 
-/// `parent[id - 1]` is the capability `id` was derived from; 0 means root.
-/// Kept outside the capability tables so an ancestor chain stays walkable after
-/// the ancestors themselves are gone.
-static LEDGER: SpinLock<Vec<u64>> = SpinLock::new(Vec::new());
+/// One entry per capability ever minted: who it was derived from, who held it,
+/// and why. Kept outside the capability tables so a chain stays walkable after
+/// the capabilities themselves are gone — which is exactly when someone asks.
+#[derive(Clone, Copy)]
+pub struct Provenance {
+    pub parent: u64,
+    pub holder: &'static str,
+    pub purpose: &'static str,
+    pub rights: u32,
+}
 
-fn register(parent: u64) -> u64 {
+static LEDGER: SpinLock<Vec<Provenance>> = SpinLock::new(Vec::new());
+
+fn register(parent: u64, holder: &'static str, purpose: &'static str, rights: u32) -> u64 {
     let mut l = LEDGER.lock();
-    l.push(parent);
+    l.push(Provenance { parent, holder, purpose, rights });
     l.len() as u64
+}
+
+/// The chain of delegation that produced `id`, nearest first.
+///
+/// This is the answer to "what did the assistant do last Tuesday, and on whose
+/// authority": every link says who held the capability and what it was for,
+/// back to whoever first created the object.
+pub fn chain(id: u64, out: &mut [(u64, Provenance)]) -> usize {
+    let ledger = LEDGER.lock();
+    let mut cur = id;
+    let mut n = 0;
+    while cur != 0 && n < out.len() {
+        let Some(&p) = ledger.get(cur as usize - 1) else { break };
+        out[n] = (cur, p);
+        n += 1;
+        cur = p.parent;
+    }
+    n
 }
 
 impl Cap {
     /// Mint the first capability to a newly created object.
     pub fn root(obj: Obj, rights: u32) -> Cap {
-        Cap { id: register(0), obj, rights, revoked: false }
+        Cap::root_for(obj, rights, "kernel", "created the object")
+    }
+
+    /// Mint a root capability, recording who it is for and why.
+    pub fn root_for(obj: Obj, rights: u32, holder: &'static str, purpose: &'static str) -> Cap {
+        Cap {
+            id: register(0, holder, purpose, rights),
+            obj,
+            rights,
+            revoked: false,
+            holder,
+            purpose,
+        }
     }
 
     /// Derive a weaker capability. Rights are intersected, never unioned: this
     /// is the only way to make a new capability, so authority can only shrink
     /// as it is delegated.
     pub fn derive(&self, rights: u32) -> Cap {
+        self.derive_for(rights, "unnamed", "unstated")
+    }
+
+    /// Derive, saying who it is for and what it is for. Every delegation an
+    /// agent makes goes through here, so the chain is complete by construction
+    /// rather than by remembering to log it.
+    pub fn derive_for(&self, rights: u32, holder: &'static str, purpose: &'static str) -> Cap {
+        let rights = self.rights & rights;
         Cap {
-            id: register(self.id),
+            id: register(self.id, holder, purpose, rights),
             obj: self.obj,
-            rights: self.rights & rights,
+            rights,
             revoked: self.revoked,
+            holder,
+            purpose,
         }
     }
 
@@ -101,14 +161,7 @@ impl Cap {
 
     /// Human-readable rights, for the audit output.
     pub fn rights_str(&self) -> &'static str {
-        match self.rights & (RIGHT_SEND | RIGHT_RECV | RIGHT_MAP | RIGHT_IRQ) {
-            r if r == RIGHT_SEND | RIGHT_RECV => "send+recv",
-            RIGHT_SEND => "send",
-            RIGHT_RECV => "recv",
-            RIGHT_MAP => "map",
-            RIGHT_IRQ => "irq",
-            _ => "none",
-        }
+        rights_name(self.rights)
     }
 
     /// What kind of thing this points at, for the audit output.
@@ -118,7 +171,28 @@ impl Cap {
             Obj::Mmio { .. } => "mmio",
             Obj::Irq(_) => "irq",
             Obj::Dma { .. } => "dma",
+            Obj::Operation(_) => "operation",
         }
+    }
+}
+
+/// Name a set of rights, for reports.
+///
+/// Its own function rather than a method, because the interesting place to
+/// print rights is a delegation chain — where the capabilities themselves are
+/// often gone and only the ledger's record of them remains.
+pub fn rights_name(rights: u32) -> &'static str {
+    match rights & RIGHTS_ALL {
+        r if r == RIGHTS_ALL => "all",
+        r if r == RIGHT_SEND | RIGHT_RECV | RIGHT_GRANT => "send+recv+grant",
+        r if r == RIGHT_SEND | RIGHT_RECV => "send+recv",
+        RIGHT_SEND => "send",
+        RIGHT_RECV => "recv",
+        RIGHT_MAP => "map",
+        RIGHT_IRQ => "irq",
+        RIGHT_GRANT => "grant",
+        0 => "none",
+        _ => "mixed",
     }
 }
 
@@ -131,7 +205,7 @@ pub fn is_descendant(id: u64, ancestor: u64) -> bool {
             return true;
         }
         cur = match ledger.get(cur as usize - 1) {
-            Some(&p) => p,
+            Some(p) => p.parent,
             None => return false,
         };
     }
