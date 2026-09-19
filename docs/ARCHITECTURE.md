@@ -122,6 +122,12 @@ declares a machine-readable interface — typed arguments, effects, idempotency,
 cost, and whether it needs confirmation — and the agent plans over that surface.
 The UI becomes one renderer of those capabilities rather than the only door in.
 
+That is also why the window system is built the way it is. An application's
+authority to draw is a capability, its windows are owned by the pid the kernel
+recorded, and a tap is delivered to one window rather than broadcast. An agent
+driving the machine and a finger driving it arrive through interfaces of the
+same shape, and neither one can reach a window it was not given.
+
 ### 3.5 Energy-aware scheduling
 
 Inference is the new dominant load. Thermal and battery policy is a first-class
@@ -215,14 +221,31 @@ point and critical, background and opportunistic work is turned away while
 interactive work still runs, and jobs can declare an energy cap that binds
 mid-flight.
 
-A display driver exists alongside the block driver, holding the same five
-capabilities and reaching nothing else — evidence that the driver framework is a
-framework rather than one device's scaffolding. It is a framebuffer and a bitmap
-font, not the display server of stage 4: no compositor, no input, no windows.
+**The software half of stage 4 is built.** Three userspace drivers now exist —
+block, display and an absolute pointer — and the third one holds *four*
+capabilities rather than five, because it has nothing to receive and so is given
+no way to. That is the strongest evidence the driver framework is a framework
+rather than one device's scaffolding: the third device needed no change to it,
+and needed *less* authority than the first.
 
-**What is not here:** stage 4 (a real display server, GPU bring-up, touch input,
-a shell) and stage 7 (power management, suspend/resume, verified boot, OTA with
-A/B slots, modem, and the long tail of thermals and reliability on real
+On top of that sits a display server with a retained background, windows in a
+stacking order, hit-testing, and damage-rectangle transfers, and two
+applications holding two capabilities each. The property worth stating is the
+routing one: a tap goes to exactly one window, and which one depends on the
+stacking order at that moment rather than on who asked last. Windows are keyed
+by the pid the kernel recorded at `send` time, so an application cannot name a
+window it did not create — the same shape of answer as everything else here,
+where identity comes from the kernel and never from the message.
+
+The compositor is inside the display driver's process rather than its own. That
+is a real compromise and it is there because a frame is 1.8 MB and there is no
+way yet for two processes to share a buffer; the split waits on shared memory
+objects.
+
+**What is not here:** the hardware half of stage 4 (a display server against
+real DRM/KMS-equivalent hardware, GPU bring-up, text layout, a shell worth
+using) and all of stage 7 (power management, suspend/resume, verified boot, OTA
+with A/B slots, modem, and the long tail of thermals and reliability on real
 silicon). Neither is a few commits away; both are the years `ROADMAP.md` says
 they are. Everything above runs under QEMU on emulated hardware, which is the
 right place to prove a scheduling and authority model and the wrong place to

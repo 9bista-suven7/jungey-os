@@ -17,6 +17,7 @@ pub const SYS_MODEL_INFO: usize = 13;
 pub const SYS_TENSOR_SUBMIT: usize = 14;
 pub const SYS_TENSOR_WAIT: usize = 15;
 pub const SYS_TENSOR_STAT: usize = 16;
+pub const SYS_RECV_FROM: usize = 17;
 
 pub const QOS_INTERACTIVE: usize = 0;
 pub const QOS_FOREGROUND: usize = 1;
@@ -32,6 +33,21 @@ unsafe fn syscall3(n: usize, a: usize, b: usize, c: usize) -> isize {
         inlateout("x0") a => ret,
         in("x1") b,
         in("x2") c,
+        options(nostack),
+    );
+    ret
+}
+
+#[inline(always)]
+unsafe fn syscall4(n: usize, a: usize, b: usize, c: usize, d: usize) -> isize {
+    let ret: isize;
+    core::arch::asm!(
+        "svc #0",
+        in("x8") n,
+        inlateout("x0") a => ret,
+        in("x1") b,
+        in("x2") c,
+        in("x3") d,
         options(nostack),
     );
     ret
@@ -177,6 +193,25 @@ pub fn send(cap: usize, msg: &[u8]) -> Result<usize, isize> {
 pub fn recv(cap: usize, buf: &mut [u8]) -> Result<usize, isize> {
     let r = unsafe { syscall3(SYS_RECV, cap, buf.as_mut_ptr() as usize, buf.len()) };
     if r < 0 { Err(r) } else { Ok(r as usize) }
+}
+
+/// Receive, and learn which process sent it.
+///
+/// A server with several clients on one channel cannot take the sender's word
+/// for who it is. This is the kernel's record of who called `send`, so a client
+/// can lie about everything except its own identity.
+pub fn recv_from(cap: usize, buf: &mut [u8]) -> Result<(usize, usize), isize> {
+    let mut from: u64 = 0;
+    let r = unsafe {
+        syscall4(
+            SYS_RECV_FROM,
+            cap,
+            buf.as_mut_ptr() as usize,
+            buf.len(),
+            &mut from as *mut u64 as usize,
+        )
+    };
+    if r < 0 { Err(r) } else { Ok((r as usize, from as usize)) }
 }
 
 /// Map the device registers `cap` names, at an address of our choosing.

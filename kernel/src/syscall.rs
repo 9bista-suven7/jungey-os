@@ -28,6 +28,7 @@ pub const SYS_MODEL_INFO: u64 = 13;
 pub const SYS_TENSOR_SUBMIT: u64 = 14;
 pub const SYS_TENSOR_WAIT: u64 = 15;
 pub const SYS_TENSOR_STAT: u64 = 16;
+pub const SYS_RECV_FROM: u64 = 17;
 
 pub const EBADCAP: isize = -1;
 pub const EPERM: isize = -2;
@@ -44,6 +45,7 @@ pub const EHOT: isize = -9;
 pub fn dispatch(frame: &mut TrapFrame) {
     let n = frame.x[8];
     let (a, b, c) = (frame.x[0] as usize, frame.x[1] as usize, frame.x[2] as usize);
+    let d = frame.x[3] as usize;
 
     let Some(pid) = sched::current_pid() else {
         frame.x[0] = EINVAL as u64;
@@ -63,7 +65,7 @@ pub fn dispatch(frame: &mut TrapFrame) {
             0
         }
         SYS_SEND => sys_send(pid, a, b, c),
-        SYS_RECV => sys_recv(pid, a, b, c),
+        SYS_RECV => sys_recv(pid, a, b, c, 0),
         SYS_GETPID => pid as isize,
         SYS_TICKS => time::ticks() as isize,
         SYS_SLEEP => {
@@ -79,6 +81,7 @@ pub fn dispatch(frame: &mut TrapFrame) {
         SYS_TENSOR_SUBMIT => sys_tensor_submit(pid, a as u64, b as u32, c as u64),
         SYS_TENSOR_WAIT => sys_tensor_wait(a as u64, b as u64),
         SYS_TENSOR_STAT => sys_tensor_stat(pid, a as u64, b),
+        SYS_RECV_FROM => sys_recv(pid, a, b, c, d),
         _ => EINVAL,
     };
 
@@ -128,7 +131,14 @@ fn sys_send(pid: usize, slot: usize, ptr: usize, len: usize) -> isize {
     }
 }
 
-fn sys_recv(pid: usize, slot: usize, ptr: usize, len: usize) -> isize {
+/// Receive, optionally learning who sent it.
+///
+/// `from_ptr`, when non-zero, is where the sender's pid is written. A server
+/// that multiplexes several clients over one channel needs to know which one
+/// spoke, and it must not be able to get that from the message body: a client
+/// that names itself can name somebody else. The kernel recorded the sender at
+/// `send` time, so this is the one answer that cannot be forged.
+fn sys_recv(pid: usize, slot: usize, ptr: usize, len: usize, from_ptr: usize) -> isize {
     loop {
         // Re-resolve every time round: the capability may have been revoked
         // while this thread was blocked, and a blocked receiver must find out.
@@ -155,6 +165,17 @@ fn sys_recv(pid: usize, slot: usize, ptr: usize, len: usize) -> isize {
             else {
                 return EFAULT;
             };
+            if from_ptr != 0 {
+                // Sixty-four bits, not thirty-two: the kernel's own sender id
+                // is `usize::MAX`, and truncating it to a u32 turns the one
+                // value no process can forge into one that any process with
+                // four billion friends could.
+                let from = (msg.from as u64).to_le_bytes();
+                let Some(Ok(())) = with_space(pid, |s| uaccess::copy_to_user(s, from_ptr, &from))
+                else {
+                    return EFAULT;
+                };
+            }
             return n as isize;
         }
 

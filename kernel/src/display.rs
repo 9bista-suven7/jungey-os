@@ -14,6 +14,12 @@ const OP_CLEAR: u8 = 0x01;
 const OP_RECT: u8 = 0x02;
 const OP_TEXT: u8 = 0x03;
 const OP_PRESENT: u8 = 0x04;
+/// Introduce a client: the server can only deliver taps to a process the
+/// kernel has vouched for, because only the kernel knows which of its
+/// capability slots reaches which pid.
+const OP_CLIENT: u8 = 0x30;
+const OP_COMPOSE: u8 = 0x31;
+const OP_STATS: u8 = 0x32;
 const OP_SHUTDOWN: u8 = 0xff;
 
 /// The server's receive buffer is one page; batches are flushed before they
@@ -38,25 +44,102 @@ pub fn frames() -> usize {
     FRAMES.load(Ordering::Relaxed)
 }
 
-fn round_trip(ops: Vec<u8>) -> bool {
+/// Send a batch and wait for the server's answer, returning it.
+///
+/// The kernel sends as `usize::MAX`, which no process can claim, and that is
+/// what lets the server tell a background command from an application's window
+/// operation without trusting anything in the message.
+fn round_trip_reply(ops: Vec<u8>) -> Option<Vec<u8>> {
     let req = REQ_CHANNEL.load(Ordering::Acquire);
     let rep = REP_CHANNEL.load(Ordering::Acquire);
     if req == usize::MAX || ops.is_empty() {
-        return false;
+        return None;
     }
     if ipc::send(req, usize::MAX, ops).is_err() {
-        return false;
+        return None;
     }
     let deadline = time::ticks() + REPLY_TIMEOUT_TICKS;
     loop {
-        if ipc::try_recv(rep).is_some() {
-            return true;
+        if let Some(m) = ipc::try_recv(rep) {
+            return Some(m.bytes);
         }
         if time::ticks() > deadline {
-            return false;
+            return None;
         }
         sched::yield_now();
     }
+}
+
+fn round_trip(ops: Vec<u8>) -> bool {
+    round_trip_reply(ops).is_some()
+}
+
+/// Tell the server that `pid` is the client behind its next spare capability
+/// slot. Order matters: the server pairs them up in the order it is told.
+pub fn introduce(pid: usize) -> bool {
+    let mut ops = alloc::vec![OP_CLIENT];
+    ops.extend_from_slice(&(pid as u32).to_le_bytes());
+    round_trip(ops)
+}
+
+/// Composite and show without redrawing the background.
+pub fn compose() -> bool {
+    round_trip(alloc::vec![OP_COMPOSE])
+}
+
+/// Make the server print what it has seen, on the console.
+pub fn request_stats() -> bool {
+    round_trip(alloc::vec![OP_STATS])
+}
+
+/// Composite, and read back what the server has seen: transfers, taps routed,
+/// taps that landed on nothing, and operations that named a window the sender
+/// did not own.
+///
+/// Every answer to the kernel carries these, so asking costs nothing beyond
+/// the frame it was going to draw anyway.
+pub fn server_stats() -> Option<ServerStats> {
+    let r = round_trip_reply(alloc::vec![OP_COMPOSE])?;
+    if r.len() < 7 {
+        return None;
+    }
+    Some(ServerStats {
+        frames: r[1] as usize,
+        taps_routed: r[2] as usize,
+        taps_on_nothing: r[3] as usize,
+        rejected: r[4] as usize,
+        windows: r[6] as usize,
+    })
+}
+
+/// What the display server reports back on every answer it gives the kernel.
+#[derive(Clone, Copy, Default)]
+pub struct ServerStats {
+    pub frames: usize,
+    pub taps_routed: usize,
+    pub taps_on_nothing: usize,
+    pub rejected: usize,
+    pub windows: usize,
+}
+
+/// Tell an application to open its window. The kernel owns the channel, so it
+/// can decide who opens first — and therefore who starts on top.
+pub fn start_app_window(channel: usize) {
+    let _ = ipc::send(channel, usize::MAX, alloc::vec![0x41u8]);
+}
+
+/// Wait until the server reports `n` windows open, or give up.
+pub fn wait_for_windows(n: usize, ticks: u64) -> bool {
+    let deadline = time::ticks() + ticks;
+    while time::ticks() < deadline {
+        if let Some(st) = server_stats() {
+            if st.windows >= n {
+                return true;
+            }
+        }
+        sched::sleep_ticks(2);
+    }
+    false
 }
 
 /// A frame under construction. Commands accumulate and are flushed in batches,

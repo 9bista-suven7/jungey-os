@@ -2,8 +2,9 @@
 # Run the full test suite: every stage's exit test, end to end, from an empty
 # disk. Prints one line per check and exits non-zero if any of them fail.
 #
-#   ./test.sh            five boots: SMP, capabilities, block I/O, crash test,
-#                        userspace driver, shared model pages, tensor scheduling
+#   ./test.sh            six boots: SMP, capabilities, block I/O, crash test,
+#                        userspace driver, shared model pages, tensor scheduling,
+#                        the agent runtime, and a screen you can tap
 #   ./test.sh --repeat N  run the whole thing N times over, for flushing out
 #                         races that only show up occasionally
 set -uo pipefail
@@ -111,6 +112,27 @@ for round in $(seq 1 "$REPEAT"); do
     check "no wait timed out"            0 "$LOG_DIR/boot5" "TIMEOUT"
     check "scheduler still correct"      1 "$LOG_DIR/boot5" "RESULT     : PASS — interactive work preempted"
     check "boot ran to completion"       1 "$LOG_DIR/boot5" "stage 6 complete"
+
+    echo "boot 6 — a screen, a pointer, and two applications"
+    # A separate boot, on its own disk: it needs a display and an input device,
+    # and the crash test above deliberately cuts the power, which is
+    # incompatible with having anything to look at.
+    timeout 180 ./tools/uitest.sh --serial "$LOG_DIR/ui" >"$LOG_DIR/uirun" 2>&1 </dev/null
+    check "pointer driven from userspace"  1 "$LOG_DIR/ui" "\[inputdrv\] attached in userspace"
+    check "input driver holds four caps"   1 "$LOG_DIR/ui" "inputdrv is pid .*holding 4 capabilities"
+    check "both applications opened"       1 "$LOG_DIR/ui" "2 windows open"
+    check "tap reached the top window"     1 "$LOG_DIR/ui" "tap at 239,370 -> pid 12 window 1"
+    check "tap reached the other window"   1 "$LOG_DIR/ui" "tap at 239,190 -> pid 11 window 0"
+    check "same point, raised window"      1 "$LOG_DIR/ui" "tap at 239,370 -> pid 11 window 0"
+    check "tap outside every window"       1 "$LOG_DIR/ui" "hit no window"
+    check "applications saw their taps"    1 "$LOG_DIR/ui" 'row 0 "GROCERIES" is now on'
+    check "raised window got the tap"      1 "$LOG_DIR/ui" 'row 5 "SLEEP" is now on'
+    check "window ownership enforced"      1 "$LOG_DIR/ui" "1 operation(s) named a window the sender does not own"
+    check "only the damage is redrawn"     1 "$LOG_DIR/ui" "smallest transfer"
+    check "ui result"                      1 "$LOG_DIR/ui" "RESULT     : PASS — every tap reached exactly one window"
+    check "no kernel panic"                0 "$LOG_DIR/ui" "KERNEL PANIC"
+    check "boot ran to completion"         1 "$LOG_DIR/ui" "stage 6 complete"
+
 done
 
 echo

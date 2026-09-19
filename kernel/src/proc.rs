@@ -19,7 +19,12 @@ pub const CAP_SLOTS: usize = 8;
 /// Top of the user stack. Below the ELF image's 4 MiB load address there is a
 /// deliberate unmapped gap; above the stack there is nothing at all.
 const USER_STACK_TOP: usize = 0x0000_0000_7000_0000;
-const USER_STACK_PAGES: usize = 4;
+/// 32 KiB. Every role in the userspace binary is inlined into one `_start`, so
+/// the entry frame is as large as the largest role's — the display server's
+/// 4 KiB message buffer, in practice. Rust emits a stack probe for a frame
+/// this size, which is why getting it wrong shows up as a clean translation
+/// fault on the first instruction rather than as silent corruption later.
+const USER_STACK_PAGES: usize = 8;
 
 /// What a range of a process's address space is for.
 ///

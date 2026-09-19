@@ -5,6 +5,10 @@
 # machine. This adds the parts that make it a *device*: a display the OS drives
 # through its own userspace GPU driver, and a way to capture what is on it.
 #
+# With --gui you can tap the windows yourself: the pointer is a real
+# virtio-input device driven by a real userspace driver. Headless, use
+# ./tools/uitest.sh, which taps it over QEMU's monitor and checks the result.
+#
 #   ./sim.sh                 boot with a screen and save screenshots
 #   ./sim.sh --gui           open a window instead (needs a desktop)
 #   ./sim.sh --shots N       how many frames to capture (default 3)
@@ -51,6 +55,7 @@ QEMU=(
     -drive file="$DISK",if=none,format=raw,id=hd0
     -device virtio-blk-device,drive=hd0
     -device virtio-gpu-device,xres=480,yres=960
+    -device virtio-tablet-device
     -kernel kernel/target/jkernel.bin
 )
 
@@ -172,4 +177,4 @@ PY
 wait "$QEMU_PID" 2>/dev/null || true
 echo
 echo "serial log:"
-sed -n '/display    :/,$p' "$RUN/serial.txt" | head -8 || true
+sed -n '/display    :/,$p' "$RUN/serial.txt" | head -14 || true

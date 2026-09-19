@@ -11,6 +11,13 @@
 //! attach guest memory as its backing store, point a scanout at it, and then
 //! transfer and flush whenever the pixels change. No 3D, no cursor plane.
 //!
+//! Since stage 4 it is also the *display server*: it owns the framebuffer, it
+//! keeps a retained command list for the background that the kernel draws, it
+//! composites the windows `wm.rs` tracks on top of it, and it decides which
+//! window a tap belongs to. Only the damaged rectangle is transferred to the
+//! host, which is the difference between moving a window costing 1.8 MB and
+//! costing a few tens of kilobytes.
+//!
 //! Spec: virtio 1.2, section 5.7.
 //!
 //! The virtqueue mechanics here are close kin to `blkdrv`'s. Two drivers is not
@@ -21,6 +28,7 @@
 use crate::font;
 use crate::say;
 use crate::sys::*;
+use crate::wm;
 
 const CAP_REQ: usize = 0;
 const CAP_REP: usize = 1;
@@ -88,11 +96,46 @@ const CMD_OFF: usize = PAGE;
 const RESP_OFF: usize = PAGE + 512;
 const FB_OFF: usize = 2 * PAGE;
 
-/// Drawing commands the display server accepts. One message is one frame.
+/// The display server's protocol.
+///
+/// The first four draw the *background*: they are retained, so the background
+/// survives a window moving over it and back without the kernel redrawing it.
 const OP_CLEAR: u8 = 0x01;
 const OP_RECT: u8 = 0x02;
 const OP_TEXT: u8 = 0x03;
 const OP_PRESENT: u8 = 0x04;
+/// A finished gesture from the input driver: where, and whether it is down.
+const OP_INPUT: u8 = 0x10;
+/// Window operations, all of them keyed by (sender, window id).
+const OP_WIN_CREATE: u8 = 0x20;
+const OP_WIN_RAISE: u8 = 0x21;
+const OP_WIN_MOVE: u8 = 0x22;
+const OP_WIN_TEXT: u8 = 0x23;
+const OP_WIN_FILL: u8 = 0x24;
+const OP_WIN_RESET: u8 = 0x25;
+/// The kernel introducing a client: which capability slot reaches which pid.
+const OP_CLIENT: u8 = 0x30;
+/// Composite and show, reporting what it cost.
+const OP_COMPOSE: u8 = 0x31;
+/// Print what the compositor has seen. The kernel asks; nobody else can,
+/// because nobody else is the kernel.
+const OP_STATS: u8 = 0x32;
+const OP_SHUTDOWN: u8 = 0xff;
+
+/// What a client is told when a tap lands on its window: window-relative, so
+/// an application never learns where its window is on screen.
+const EV_TAP: u8 = 0x40;
+
+/// `ipc::send` records the sender, and the kernel sends as `usize::MAX`. A
+/// process cannot claim that, because it does not choose the value.
+const KERNEL: usize = usize::MAX;
+
+/// The compositor's capability slots past the five every driver holds: one
+/// send capability per client it may deliver events to.
+const CAP_CLIENT_BASE: usize = 5;
+const MAX_CLIENTS: usize = 4;
+
+static mut WINDOWS: wm::Wm = wm::Wm::new();
 
 static mut MMIO_VA: usize = 0;
 
@@ -116,6 +159,14 @@ struct Gpu {
     last_used: u16,
     avail_idx: u16,
     frames: u64,
+    /// Pixels actually sent to the host, so "we only redrew the damage" is a
+    /// number rather than a claim.
+    pixels: u64,
+    /// The smallest transfer so far. The background is redrawn whole on every
+    /// frame the kernel sends, so the average says little; what a damage
+    /// rectangle buys shows up in the cheapest frame, which is the one where
+    /// only a window changed.
+    smallest: u64,
 }
 
 impl Gpu {
@@ -219,14 +270,23 @@ impl Gpu {
         self.submit(at - CMD_OFF)
     }
 
-    /// Push the guest framebuffer to the host resource, then show it.
-    fn present(&mut self) -> bool {
+    /// Push one rectangle of the guest framebuffer to the host, then show it.
+    ///
+    /// The whole screen is the special case, not the rule: `offset` is where
+    /// the rectangle's first pixel lives in the backing store, so the device
+    /// reads exactly the pixels that changed. A window moving 200 px across a
+    /// 480x960 screen transfers about a twentieth of it.
+    fn present_rect(&mut self, r: wm::Rect) -> bool {
+        let r = r.clamp_to_screen();
+        if r.w == 0 || r.h == 0 {
+            return true;
+        }
         let mut at = self.hdr(CMD_OFF, CMD_TRANSFER_TO_HOST_2D);
-        at = self.put_u32(at, 0);
-        at = self.put_u32(at, 0);
-        at = self.put_u32(at, WIDTH as u32);
-        at = self.put_u32(at, HEIGHT as u32);
-        at = self.put_u64(at, 0); // offset into the resource
+        at = self.put_u32(at, r.x as u32);
+        at = self.put_u32(at, r.y as u32);
+        at = self.put_u32(at, r.w as u32);
+        at = self.put_u32(at, r.h as u32);
+        at = self.put_u64(at, ((r.y * WIDTH + r.x) * 4) as u64);
         at = self.put_u32(at, RESOURCE_ID);
         at = self.put_u32(at, 0);
         if !self.submit(at - CMD_OFF) {
@@ -234,15 +294,17 @@ impl Gpu {
         }
 
         let mut at = self.hdr(CMD_OFF, CMD_RESOURCE_FLUSH);
-        at = self.put_u32(at, 0);
-        at = self.put_u32(at, 0);
-        at = self.put_u32(at, WIDTH as u32);
-        at = self.put_u32(at, HEIGHT as u32);
+        at = self.put_u32(at, r.x as u32);
+        at = self.put_u32(at, r.y as u32);
+        at = self.put_u32(at, r.w as u32);
+        at = self.put_u32(at, r.h as u32);
         at = self.put_u32(at, RESOURCE_ID);
         at = self.put_u32(at, 0);
         let ok = self.submit(at - CMD_OFF);
         if ok {
             self.frames += 1;
+            self.pixels += r.area() as u64;
+            self.smallest = self.smallest.min(r.area() as u64);
         }
         ok
     }
@@ -306,7 +368,8 @@ impl Gpu {
             wr(STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
         }
 
-        let mut gpu = Gpu { dma_phys, last_used: 0, avail_idx: 0, frames: 0 };
+        let mut gpu =
+            Gpu { dma_phys, last_used: 0, avail_idx: 0, frames: 0, pixels: 0, smallest: u64::MAX };
         if !gpu.create_resource() {
             say("  [gpudrv  ]", " the device refused to create a resource");
             return None;
@@ -324,10 +387,27 @@ impl Gpu {
 }
 
 // ---- drawing -------------------------------------------------------------
+//
+// Everything here writes through `px`, which clips. Clipping is not a
+// nicety: compositing the damaged rectangle means replaying drawing commands
+// that mostly fall outside it, and the cheapest correct way to handle that is
+// to let them run and drop the pixels that miss.
+
+static mut CLIP: wm::Rect = wm::Rect { x: 0, y: 0, w: WIDTH, h: HEIGHT };
+
+fn set_clip(r: wm::Rect) {
+    unsafe { core::ptr::write_volatile(&raw mut CLIP, r.clamp_to_screen()) };
+}
+
+#[inline]
+fn clip() -> wm::Rect {
+    unsafe { core::ptr::read_volatile(&raw const CLIP) }
+}
 
 #[inline]
 fn px(x: usize, y: usize, color: u32) {
-    if x >= WIDTH || y >= HEIGHT {
+    let c = clip();
+    if !c.contains(x, y) {
         return;
     }
     unsafe {
@@ -335,16 +415,16 @@ fn px(x: usize, y: usize, color: u32) {
     }
 }
 
-fn clear(color: u32) {
-    for i in 0..WIDTH * HEIGHT {
-        unsafe { core::ptr::write_volatile((DMA_VA + FB_OFF + i * 4) as *mut u32, color) };
-    }
-}
-
-fn rect(x: usize, y: usize, w: usize, h: usize, color: u32) {
-    for dy in 0..h {
-        for dx in 0..w {
-            px(x + dx, y + dy, color);
+fn fill(x: usize, y: usize, w: usize, h: usize, color: u32) {
+    let c = clip();
+    let x0 = x.max(c.x);
+    let y0 = y.max(c.y);
+    let x1 = (x + w).min(c.x + c.w).min(WIDTH);
+    let y1 = (y + h).min(c.y + c.h).min(HEIGHT);
+    for row in y0..y1 {
+        let base = DMA_VA + FB_OFF + (row * WIDTH) * 4;
+        for col in x0..x1 {
+            unsafe { core::ptr::write_volatile((base + col * 4) as *mut u32, color) };
         }
     }
 }
@@ -376,6 +456,19 @@ fn text(s: &[u8], x: usize, y: usize, scale: usize, color: u32) {
     }
 }
 
+/// The window manager draws through this and knows nothing else about the
+/// framebuffer.
+struct Fb;
+
+impl wm::Painter for Fb {
+    fn fill(&mut self, x: usize, y: usize, w: usize, h: usize, color: u32) {
+        fill(x, y, w, h, color)
+    }
+    fn text(&mut self, x: usize, y: usize, scale: usize, color: u32, bytes: &[u8]) {
+        text(bytes, x, y, scale.max(1), color)
+    }
+}
+
 fn be16(b: &[u8]) -> usize {
     ((b[0] as usize) << 8) | b[1] as usize
 }
@@ -384,7 +477,103 @@ fn le32(b: &[u8]) -> u32 {
     u32::from_le_bytes([b[0], b[1], b[2], b[3]])
 }
 
-/// The display server: take a frame's worth of drawing commands, render, show.
+// ---- the background, retained ---------------------------------------------
+//
+// The kernel draws the background as a list of commands. Keeping the list —
+// rather than only the pixels it produced — is what makes a partial redraw
+// possible: when a window moves, the strip it uncovered has to be drawn again,
+// and only the commands know what was under it.
+
+const ROOT_CAPACITY: usize = 16384;
+static mut ROOT: [u8; ROOT_CAPACITY] = [0; ROOT_CAPACITY];
+static mut ROOT_LEN: usize = 0;
+
+fn root_reset() {
+    unsafe { core::ptr::write_volatile(&raw mut ROOT_LEN, 0) };
+}
+
+fn root_append(bytes: &[u8]) {
+    unsafe {
+        let len = core::ptr::read_volatile(&raw const ROOT_LEN);
+        if len + bytes.len() > ROOT_CAPACITY {
+            return; // a background too complex to retain simply stops growing
+        }
+        let dst = (&raw mut ROOT) as *mut u8;
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst.add(len), bytes.len());
+        core::ptr::write_volatile(&raw mut ROOT_LEN, len + bytes.len());
+    }
+}
+
+/// Replay the retained background into the current clip.
+fn root_paint() {
+    let (buf, len) = unsafe {
+        (
+            core::slice::from_raw_parts((&raw const ROOT) as *const u8, ROOT_CAPACITY),
+            core::ptr::read_volatile(&raw const ROOT_LEN),
+        )
+    };
+    let mut i = 0;
+    while i < len {
+        match buf[i] {
+            OP_CLEAR => {
+                fill(0, 0, WIDTH, HEIGHT, le32(&buf[i + 1..]));
+                i += 5;
+            }
+            OP_RECT => {
+                fill(
+                    be16(&buf[i + 1..]),
+                    be16(&buf[i + 3..]),
+                    be16(&buf[i + 5..]),
+                    be16(&buf[i + 7..]),
+                    le32(&buf[i + 9..]),
+                );
+                i += 13;
+            }
+            OP_TEXT => {
+                let x = be16(&buf[i + 1..]);
+                let y = be16(&buf[i + 3..]);
+                let color = le32(&buf[i + 5..]);
+                let scale = buf[i + 9] as usize;
+                let n = buf[i + 10] as usize;
+                text(&buf[i + 11..i + 11 + n], x, y, scale.max(1), color);
+                i += 11 + n;
+            }
+            _ => break,
+        }
+    }
+}
+
+// ---- the display server ---------------------------------------------------
+
+struct Clients {
+    pid: [usize; MAX_CLIENTS],
+    n: usize,
+}
+
+impl Clients {
+    /// Which capability slot reaches `pid`, if any. A client the kernel never
+    /// introduced is not reachable, so its taps go nowhere and are counted.
+    fn slot(&self, pid: usize) -> Option<usize> {
+        self.pid[..self.n].iter().position(|&p| p == pid).map(|i| CAP_CLIENT_BASE + i)
+    }
+}
+
+/// Composite and show. Returns the fraction of the screen that was sent.
+fn compose(gpu: &mut Gpu, w: &mut wm::Wm) -> usize {
+    let damage = w.damage.clamp_to_screen();
+    if damage.w == 0 || damage.h == 0 {
+        return 0;
+    }
+    set_clip(damage);
+    root_paint();
+    w.paint(&mut Fb);
+    set_clip(wm::Rect { x: 0, y: 0, w: WIDTH, h: HEIGHT });
+    gpu.present_rect(damage);
+    w.damage = wm::Rect::EMPTY;
+    damage.area() * 100 / (WIDTH * HEIGHT)
+}
+
+/// The display server: background, windows, input routing, and the device.
 pub fn run() {
     let Some(mut gpu) = Gpu::attach() else {
         say("  [gpudrv  ]", " failed to attach; exiting");
@@ -399,61 +588,240 @@ pub fn run() {
         .x(gpu.dma_phys + FB_OFF)
         .nl();
 
-    clear(0xff000000);
-    gpu.present();
+    // The window list is a static, not a local: it is a few kilobytes, this
+    // process has one of it, and the roles in this binary are all inlined into
+    // one `_start`, so a large stack frame here is a large stack frame for
+    // every process the system runs.
+    let windows: &mut wm::Wm = unsafe { &mut *(&raw mut WINDOWS) };
+    let mut clients = Clients { pid: [0; MAX_CLIENTS], n: 0 };
+
+    fill(0, 0, WIDTH, HEIGHT, 0xff000000);
+    gpu.present_rect(wm::Rect { x: 0, y: 0, w: WIDTH, h: HEIGHT });
 
     let mut msg = [0u8; 4096];
     loop {
-        let n = match recv(CAP_REQ, &mut msg) {
-            Ok(n) => n,
+        let (n, from) = match recv_from(CAP_REQ, &mut msg) {
+            Ok(r) => r,
             Err(_) => return,
         };
+        if n == 0 {
+            continue; // the input driver's heartbeat: nothing to do
+        }
 
         let mut i = 0;
         let mut shutdown = false;
         while i < n {
             match msg[i] {
-                OP_CLEAR => {
-                    clear(le32(&msg[i + 1..]));
+                // ---- the background, which only the kernel may draw ----
+                OP_CLEAR if from == KERNEL => {
+                    root_reset();
+                    root_append(&msg[i..i + 5]);
+                    windows.dirty_all();
                     i += 5;
                 }
-                OP_RECT => {
-                    rect(
-                        be16(&msg[i + 1..]),
-                        be16(&msg[i + 3..]),
-                        be16(&msg[i + 5..]),
-                        be16(&msg[i + 7..]),
-                        le32(&msg[i + 9..]),
-                    );
+                OP_RECT if from == KERNEL => {
+                    root_append(&msg[i..i + 13]);
+                    windows.dirty(wm::Rect {
+                        x: be16(&msg[i + 1..]),
+                        y: be16(&msg[i + 3..]),
+                        w: be16(&msg[i + 5..]),
+                        h: be16(&msg[i + 7..]),
+                    });
                     i += 13;
                 }
-                OP_TEXT => {
-                    let x = be16(&msg[i + 1..]);
-                    let y = be16(&msg[i + 3..]);
-                    let color = le32(&msg[i + 5..]);
-                    let scale = msg[i + 9] as usize;
+                OP_TEXT if from == KERNEL => {
                     let len = msg[i + 10] as usize;
-                    text(&msg[i + 11..i + 11 + len], x, y, scale.max(1), color);
+                    root_append(&msg[i..i + 11 + len]);
+                    let scale = msg[i + 9].max(1) as usize;
+                    windows.dirty(wm::Rect {
+                        x: be16(&msg[i + 1..]),
+                        y: be16(&msg[i + 3..]),
+                        w: len * 8 * scale,
+                        h: 8 * scale,
+                    });
                     i += 11 + len;
                 }
-                OP_PRESENT => {
-                    gpu.present();
+                OP_PRESENT | OP_COMPOSE => {
+                    compose(&mut gpu, windows);
                     i += 1;
                 }
-                0xff => {
+
+                // ---- input, from the driver that holds the device ----
+                OP_INPUT => {
+                    let x = be16(&msg[i + 1..]);
+                    let y = be16(&msg[i + 3..]);
+                    let down = msg[i + 5] != 0;
+                    if down {
+                        route_tap(&clients, windows, x, y);
+                    }
+                    i += 6;
+                }
+
+                // ---- windows: keyed by (sender, id), never by id alone ----
+                OP_WIN_CREATE => {
+                    let id = msg[i + 1];
+                    let rect = wm::Rect {
+                        x: be16(&msg[i + 2..]),
+                        y: be16(&msg[i + 4..]),
+                        w: be16(&msg[i + 6..]),
+                        h: be16(&msg[i + 8..]),
+                    };
+                    let bg = le32(&msg[i + 10..]);
+                    let tl = msg[i + 14] as usize;
+                    windows.create(from, id, rect, bg, &msg[i + 15..i + 15 + tl]);
+                    i += 15 + tl;
+                }
+                OP_WIN_RAISE => {
+                    windows.raise(from, msg[i + 1]);
+                    i += 2;
+                }
+                OP_WIN_MOVE => {
+                    let (x, y) = (be16(&msg[i + 2..]), be16(&msg[i + 4..]));
+                    windows.with(from, msg[i + 1], |w| {
+                        w.rect.x = x;
+                        w.rect.y = y;
+                        w.rect = w.rect.clamp_to_screen();
+                    });
+                    i += 6;
+                }
+                OP_WIN_FILL => {
+                    let cmd = wm::Cmd::Fill {
+                        x: be16(&msg[i + 2..]),
+                        y: be16(&msg[i + 4..]),
+                        w: be16(&msg[i + 6..]),
+                        h: be16(&msg[i + 8..]),
+                        color: le32(&msg[i + 10..]),
+                    };
+                    windows.push(from, msg[i + 1], cmd);
+                    i += 14;
+                }
+                // [op][win][x:2][y:2][color:4][scale][len][bytes]
+                OP_WIN_TEXT => {
+                    let raw = msg[i + 11] as usize;
+                    let len = raw.min(wm::MAX_TEXT);
+                    let mut bytes = [0u8; wm::MAX_TEXT];
+                    bytes[..len].copy_from_slice(&msg[i + 12..i + 12 + len]);
+                    let cmd = wm::Cmd::Text {
+                        x: be16(&msg[i + 2..]),
+                        y: be16(&msg[i + 4..]),
+                        color: le32(&msg[i + 6..]),
+                        scale: msg[i + 10].max(1) as usize,
+                        len,
+                        bytes,
+                    };
+                    windows.push(from, msg[i + 1], cmd);
+                    i += 12 + raw;
+                }
+                OP_WIN_RESET => {
+                    windows.reset(from, msg[i + 1]);
+                    i += 2;
+                }
+
+                // ---- the kernel wiring the system together ----
+                OP_CLIENT if from == KERNEL => {
+                    if clients.n < MAX_CLIENTS {
+                        clients.pid[clients.n] =
+                            u32::from_le_bytes([msg[i + 1], msg[i + 2], msg[i + 3], msg[i + 4]])
+                                as usize;
+                        clients.n += 1;
+                    }
+                    i += 5;
+                }
+                OP_STATS if from == KERNEL => {
+                    report(&gpu, windows);
+                    i += 1;
+                }
+                OP_SHUTDOWN if from == KERNEL => {
                     shutdown = true;
                     break;
                 }
-                _ => break, // malformed: stop rather than guess
+                _ => break, // malformed, or a client reaching past its authority
             }
         }
 
-        let reply = [0u8, (gpu.frames & 0xff) as u8];
-        let _ = send(CAP_REP, &reply);
+        // Only the kernel is answered, and the answer carries the counters
+        // the kernel needs to judge whether the session went the way it was
+        // supposed to. An application learns nothing about anyone else.
+        if from == KERNEL {
+            let reply = [
+                0u8,
+                (gpu.frames & 0xff) as u8,
+                windows.taps_routed as u8,
+                windows.taps_on_nothing as u8,
+                windows.rejected as u8,
+                (windows.composes & 0xff) as u8,
+                windows.open() as u8,
+            ];
+            let _ = send(CAP_REP, &reply);
+        }
         if shutdown {
             let mut l = Line::new();
             l.s("  [gpudrv  ] shutting down after ").d(gpu.frames as usize).s(" frames").nl();
             return;
         }
     }
+}
+
+/// Deliver a tap to exactly one window, or to nobody.
+fn route_tap(clients: &Clients, windows: &mut wm::Wm, x: usize, y: usize) {
+    let Some((owner, id, rx, ry)) = windows.hit(x, y) else {
+        windows.taps_on_nothing += 1;
+        let mut l = Line::new();
+        l.s("  [gpudrv  ] tap at ").d(x).s(",").d(y).s(" hit no window").nl();
+        return;
+    };
+    let Some(slot) = clients.slot(owner) else {
+        windows.taps_on_nothing += 1;
+        return;
+    };
+    let ev = [EV_TAP, id, (rx >> 8) as u8, rx as u8, (ry >> 8) as u8, ry as u8, 1];
+    if send(slot, &ev).is_ok() {
+        windows.taps_routed += 1;
+        let mut l = Line::new();
+        l.s("  [gpudrv  ] tap at ")
+            .d(x)
+            .s(",")
+            .d(y)
+            .s(" -> pid ")
+            .d(owner)
+            .s(" window ")
+            .d(id as usize)
+            .s(" at ")
+            .d(rx)
+            .s(",")
+            .d(ry)
+            .nl();
+    }
+}
+
+fn report(gpu: &Gpu, w: &wm::Wm) {
+    let mut l = Line::new();
+    l.s("  [gpudrv  ] ")
+        .d(w.composes)
+        .s(" composites, ")
+        .d(gpu.frames as usize)
+        .s(" transfers, ")
+        .d((gpu.pixels / 1000) as usize)
+        .s("k pixels sent of ")
+        .d(gpu.frames as usize * WIDTH * HEIGHT / 1000)
+        .s("k a full screen would have cost")
+        .nl();
+    if gpu.smallest != u64::MAX {
+        let mut l = Line::new();
+        l.s("  [gpudrv  ] smallest transfer ")
+            .d(gpu.smallest as usize / 1000)
+            .s("k pixels, ")
+            .d((gpu.smallest as usize * 100) / (WIDTH * HEIGHT))
+            .s("% of the screen — a tap redraws one window, not the display")
+            .nl();
+    }
+    let mut l = Line::new();
+    l.s("  [gpudrv  ] ")
+        .d(w.taps_routed)
+        .s(" taps routed, ")
+        .d(w.taps_on_nothing)
+        .s(" landed on nothing, ")
+        .d(w.rejected)
+        .s(" operations named a window the sender does not own")
+        .nl();
 }

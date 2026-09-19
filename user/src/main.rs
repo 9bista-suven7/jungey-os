@@ -1,8 +1,9 @@
 //! Jungey OS userspace test programs.
 //!
-//! One binary, three roles. The kernel picks a role by putting it in x0 before
+//! One binary, many roles. The kernel picks a role by putting it in x0 before
 //! `eret`-ing to EL0, which is the closest thing to `argv` that exists at this
-//! stage.
+//! stage. Three of the roles are device drivers, two are applications, and the
+//! rest are the small programs that stand in for the tests each stage needs.
 //!
 //! Nothing here can do anything except through `svc #0`: no ambient authority,
 //! no shared memory with the kernel, and no capability it was not handed.
@@ -10,10 +11,13 @@
 #![no_std]
 #![no_main]
 
+mod app;
 mod blkdrv;
 mod font;
 mod gpudrv;
+mod inputdrv;
 mod sys;
+mod wm;
 
 use sys::*;
 
@@ -27,6 +31,9 @@ pub const ROLE_MODEL_B: usize = 6;
 pub const ROLE_INFER_UI: usize = 7;
 pub const ROLE_INFER_BG: usize = 8;
 pub const ROLE_GPUDRV: usize = 9;
+pub const ROLE_INPUTDRV: usize = 10;
+pub const ROLE_SHELL: usize = 11;
+pub const ROLE_NOTES: usize = 12;
 
 /// Where a mapped model goes in our address space. High enough to be clear of
 /// the image and the heap, low enough to be obviously user memory.
@@ -65,6 +72,9 @@ pub extern "C" fn _start(role: usize) -> ! {
         ROLE_INFER_UI => infer_interactive(),
         ROLE_INFER_BG => infer_background(),
         ROLE_GPUDRV => gpudrv::run(),
+        ROLE_INPUTDRV => inputdrv::run(),
+        ROLE_SHELL => app::run(&app::SHELL),
+        ROLE_NOTES => app::run(&app::NOTES),
         _ => write("user: unknown role\n"),
     }
     exit(0)

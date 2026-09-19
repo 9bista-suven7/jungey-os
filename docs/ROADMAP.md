@@ -391,27 +391,114 @@ client:**
 
 ---
 
-## Stage 4 — Graphics, input, the shell
+## Stage 4 — Graphics, input, the shell  ◐ *4a done, the rest is hardware*
 
-*Partly anticipated by `sim.sh`.* A userspace virtio-gpu driver now puts a
-status screen on a simulated 480x960 display, using the same capability
-framework as the block driver — five capabilities, no way to reach a second
-device. That is a framebuffer and a bitmap font, not a display server: no
-compositor, no input, no windows, and no GPU acceleration. It exists because a
-device that cannot show anything is hard to reason about, and because a second
-driver was the only way to find out whether the stage 3d framework fitted
-anything but the device it was designed around. It did.
-
-
-Display server on DRM/KMS-equivalent, GPU bring-up (Panfrost/Freedreno as
-reference), a compositor, touch input, fonts and text layout, and a first shell.
-This is where it stops being a console and starts being a device.
+Display server, GPU bring-up (Panfrost/Freedreno as reference), a compositor,
+touch input, fonts and text layout, and a first shell. This is where it stops
+being a console and starts being a device.
 
 **Exit test:** touch a button on a real panel on real hardware and something
 happens at 60 fps.
 
-*Cost: 4–8 months. Text layout and font rendering alone are a month you won't
-have budgeted for.*
+### 4a — A pointer, a compositor, and two applications  ✅ *done*
+
+The part of stage 4 that does not need a panel or a GPU: who owns a window, who
+a tap belongs to, and whether an application can reach past what it holds. It
+is worth doing first because it is the part the rest has to be built on, and
+because getting it wrong is invisible until much later.
+
+A third userspace driver (virtio-input, an absolute pointer — which is what a
+touchscreen looks like to software) holds **four** capabilities rather than
+five: it has nothing to receive, so it is given no way to. The display server
+keeps a retained command list for the background, composites windows over it,
+and transfers only the damaged rectangle. Two applications hold **two**
+capabilities each — send window operations, receive taps on their own windows —
+and that is the entirety of what they can do.
+
+**Exit test:** a tap goes to exactly one window, the same pixel goes to a
+different application once the one underneath is raised, a tap outside every
+window goes nowhere, and an application cannot touch a window it did not
+create. ✅
+
+```
+  bus        : input device in a virtio transport at 0xa003a00, intid 77
+  input      : inputdrv is pid 10, holding 4 capabilities:
+    slot 0     #16 channel (send)
+    slot 1     #17 mmio (map)
+    slot 2     #18 irq (irq)
+    slot 3     #19 dma (map)
+  [inputdrv] attached in userspace: "QEMU Virtio Tablet", dma at 0x405eb000
+  [inputdrv] absolute pointer, x 0..32767, y 0..32767 -> 480x960
+  ui         : shell is pid 11 (2 capabilities), notes is pid 12 (2 capabilities)
+  ui         : 2 windows open, notes on top of the shell where they overlap
+
+  [gpudrv  ] tap at 239,370 -> pid 12 window 1 at 169,40
+  [notes   ] row 0 "GROCERIES" is now on
+  [gpudrv  ] tap at 239,190 -> pid 11 window 0 at 209,40
+  [shell   ] row 0 "RUN A MODEL" is now on
+  [gpudrv  ] tap at 239,370 -> pid 11 window 0 at 209,220
+  [shell   ] row 5 "SLEEP" is now on
+  [gpudrv  ] tap at 239,699 hit no window
+
+  taps       : 3 routed to a window, 1 landed on nothing
+  ownership  : 1 operation(s) named a window the sender does not own, all refused
+  [gpudrv  ] smallest transfer 85k pixels, 18% of the screen
+  RESULT     : PASS — every tap reached exactly one window, the same point
+               went to a different application once the one underneath was
+               raised, a tap outside every window reached nobody, and an
+               application could not touch a window it did not create
+```
+
+The taps are real: `tools/uitest.sh` injects them through QEMU's monitor, so
+they arrive at the guest's virtio-input device exactly as a finger's would, and
+everything past the device registers is the system under test. `./sim.sh --gui`
+lets you tap it yourself.
+
+**The interesting line is the third tap.** It is the same pixel as the first and
+it goes to a different process, because tapping a window raises it. A
+compositor that remembered who asked last, or delivered to everyone and let the
+applications sort it out, would pass the first two taps and fail that one.
+
+**Windows are keyed by (owner, id), and the owner is the pid the kernel
+recorded at `send` time** — not a field in the message. That is what makes the
+ownership check trustworthy rather than polite: `notes` asks to move window 0,
+which belongs to the shell, and finds nothing of its own by that name. The
+kernel's own sender id is `usize::MAX`, which no process can hold, so the
+server can tell a background command from an application's window operation
+without trusting anything it was told. This was briefly broken: the sender was
+copied out to userspace as a `u32`, which truncated `usize::MAX` into a value a
+process could in principle hold, and every command from the kernel was rejected
+as malformed. The symptom was three taps vanishing in silence — a good
+reminder that an identity check fails quietly in both directions.
+
+**Deviations, and the first is the one that matters:**
+
+- ***The compositor runs inside the display driver's process, not its own.***
+  Sending each frame to a separate compositor would mean copying 1.8 MB through
+  a message queue per frame, because there is no way yet for two processes to
+  share a buffer. The split is the right design and it waits on shared memory
+  objects; putting it in now would mean either a wrong number or a fake one.
+- *Damage is one bounding box*, not a list of rectangles, so two changes far
+  apart over-report. The number printed is what was actually transferred, so
+  the over-reporting is visible rather than hidden.
+- *No GPU acceleration*: every pixel is written by the CPU. There is no NPU and
+  no GPU under QEMU, and Panfrost-equivalent bring-up is a stage of its own.
+- *No text layout.* An 8x8 bitmap font, uppercase folded, no kerning, no
+  shaping, no scripts other than ASCII. Real text layout is the month nobody
+  budgets for, and it is still ahead.
+- *The title bar's height is part of the protocol* because the server draws it
+  and the client does the hit-testing inside its own window. A cleaner design
+  sends the content origin with the event.
+- *A window's title is what the server draws and the only decoration there is.*
+  No resize, no close button, no drag.
+
+**What is left of stage 4 is the hardware half**, and it is the expensive half:
+a display server against real DRM/KMS-equivalent hardware, a GPU driver, a
+compositor that hits 60 fps on a panel rather than an emulator, text layout, and
+a shell somebody would want to use.
+
+*Cost: 4–8 months for the rest. Text layout and font rendering alone are a month
+you won't have budgeted for.*
 
 ---
 
@@ -797,15 +884,16 @@ everything else.*
 
 ## Reality check
 
-**Where this actually stands.** Stages 0, 1, 2, 3 (a–d), 5 (a–d) and 6 are
-built, and each one's exit test runs — `./test.sh` is about forty assertions
-across five boots, and it fails rather than hangs. Stages 4 and 7 are not, and
-neither is a matter of another few commits: stage 4 needs a real GPU and a real
-panel, and stage 7 needs a real phone, a modem, a key store and the patience to
-carry one as a daily driver. Both are listed here as years because they are
-years. The honest summary is that the *scheduling and safety* story — inference
-as a scheduled resource, authority you can trace, actions you can undo — is real
-and tested under QEMU, and the *device* story has not started.
+**Where this actually stands.** Stages 0, 1, 2, 3 (a–d), 4a, 5 (a–d) and 6 are
+built, and each one's exit test runs — `./test.sh` is sixty-odd assertions
+across six boots, and it fails rather than hangs. The rest of stage 4 and all of
+stage 7 are not, and neither is a matter of another few commits: stage 4 needs a
+real GPU and a real panel, and stage 7 needs a real phone, a modem, a key store
+and the patience to carry one as a daily driver. Both are listed here as years
+because they are years. The honest summary is that the *software* story —
+inference as a scheduled resource, authority you can trace, actions you can
+undo, a tap that goes to exactly one window — is real and tested under QEMU, and
+the *device* story has not started.
 
 Stages 0–3 are a genuinely achievable solo project and teach more than any
 course. Stage 5 is where the idea becomes *worth something* — and it is reachable

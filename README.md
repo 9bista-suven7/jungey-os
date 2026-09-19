@@ -12,6 +12,14 @@ Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and
 
 ## Status
 
+**Stage 4a — you can tap it.** A third userspace driver reads an absolute
+pointer, the display server composites windows over the background and
+transfers only the damaged rectangle, and two applications hold two
+capabilities each. A tap goes to exactly one window; the same pixel goes to a
+*different* application once the one underneath is raised; a tap outside every
+window goes nowhere; and an application cannot touch a window it did not
+create. `./tools/uitest.sh` taps it through QEMU's monitor and checks all four.
+
 **Stage 6 — an agent you can hold to account.** An assistant composes
 operations that applications published for their own use and that nobody wrote
 for the task; every action it takes is attributable to a delegation chain three
@@ -21,11 +29,12 @@ planner — see [`docs/ROADMAP.md`](docs/ROADMAP.md) for why building the safety
 around it first is the point.
 
 **It has a screen.** `./sim.sh` boots the OS as a simulated device with a
-display, driven by a userspace virtio-gpu driver holding the same five
-capabilities as the block driver. The status screen is drawn by the kernel and
-rendered by an unprivileged process.
+display, driven by a userspace virtio-gpu driver. The status screen is drawn by
+the kernel and rendered by an unprivileged process; the two windows on top of
+it belong to two ordinary applications, and the pointer that drives them is a
+fourth device with a driver of its own.
 
-![Jungey OS status screen](docs/screenshot.png)
+![Jungey OS, with two application windows over the status screen](docs/screenshot.png)
 
 **Stage 5b — inference is scheduled.** Accelerator time has QoS classes,
 deadlines it either accepts or refuses, and preemption at segment boundaries. An
@@ -108,7 +117,7 @@ its demos finish, so `./run.sh` normally returns on its own in about a second.
 To run every stage's exit test end to end:
 
 ```bash
-./test.sh              # five boots from an empty disk
+./test.sh              # six boots from an empty disk
 ./test.sh --repeat 5   # the whole thing five times over, to shake out races
 ```
 
@@ -116,7 +125,8 @@ To run it as a device with a screen:
 
 ```bash
 ./sim.sh               # boots with a display, saves frames to screenshots/
-./sim.sh --gui         # opens a window instead, if you have a desktop
+./sim.sh --gui         # opens a window instead, if you have a desktop — tap it
+./tools/uitest.sh      # boots, taps four places over QMP, checks where they went
 ```
 
 QEMU is the simulator in both cases — it emulates the cores, the GIC, the
@@ -342,6 +352,28 @@ detects modification, it does not prevent it, and it would not survive an
 attacker who is trying. Preventing it needs a hardware root of trust, which is
 stage 7.
 
+**Windows and input (stage 4a)**
+
+- **A tap goes to exactly one window** — the topmost one containing the point,
+  not the one that asked last and not all of them.
+- **The same pixel, a different application.** The third tap lands where the
+  first did and reaches the other process, because the window underneath was
+  raised in between. That one check is the difference between a compositor and
+  a lookup table.
+- **A tap outside every window reaches nobody**, and is counted rather than
+  quietly delivered somewhere.
+- **A window belongs to the process that created it.** Windows are keyed by
+  (owner, id), where the owner is the pid the *kernel* recorded at `send` time.
+  One application asks to move another's window and finds nothing of its own by
+  that name.
+- **Only the damage is redrawn.** A tap transfers 18% of the screen, not all of
+  it, because the background is a retained command list and the damaged
+  rectangle is what goes to the device.
+
+The compositor lives inside the display driver's process. Splitting it out is
+the right design and it is not done: without shared buffers it would cost 1.8 MB
+of copying per frame, and the README would rather say that than pretend.
+
 The kernel powers off through PSCI when it finishes, so `./run.sh` returns
 rather than idling forever.
 
@@ -377,15 +409,21 @@ os/
 ├── run.sh                    build + boot under QEMU
 ├── sim.sh                    boot as a device with a screen, capture frames
 ├── test.sh                   every stage's exit test, end to end
+├── tools/
+│   ├── uitest.sh             boot with a pointer and tap it over QMP
+│   └── tap.py                the taps, and what each one should reach
 ├── docs/
 │   ├── ARCHITECTURE.md       the design and why it is shaped this way
 │   └── ROADMAP.md            stages 0-7, exit tests, honest costs
 ├── user/                     userspace, built and embedded by the kernel build
 │   ├── linker.ld             loaded at 4 MiB, segments grouped by permission
 │   └── src/
-│       ├── main.rs           the test roles
+│       ├── main.rs           the roles, picked by the kernel at start
 │       ├── blkdrv.rs         the virtio-blk driver — an ordinary process
-│       ├── gpudrv.rs         the virtio-gpu driver — likewise
+│       ├── gpudrv.rs         the virtio-gpu driver, and the display server
+│       ├── inputdrv.rs       the virtio-input driver — four capabilities
+│       ├── wm.rs             windows, stacking, hit-testing, damage
+│       ├── app.rs            an application: two capabilities and a window
 │       ├── font.rs           an 8x8 bitmap font, generated from ASCII art
 │       └── sys.rs            syscall stubs — the whole kernel interface
 └── kernel/
@@ -437,7 +475,7 @@ os/
   TTBR0   VA 0x0000_0000_0040_0000        user text   (r-x at EL0)
           VA 0x0000_0000_0040_1000        user rodata (r-- at EL0)
           VA 0x0000_0000_0040_2000        user data   (rw- at EL0)
-          VA 0x0000_0000_6FFF_C000        user stack, 16 KiB
+          VA 0x0000_0000_6FFF_8000        user stack, 32 KiB
 ```
 
 Every user mapping sets PXN, so a kernel bug that jumps into user memory faults

@@ -76,7 +76,7 @@ const RULE: &str = "  ----------------------------------------------------------
 #[no_mangle]
 pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
     println!("{}", BANNER);
-    println!("  Jungey OS  v0.12.0  ·  stage 6  ·  aarch64");
+    println!("  Jungey OS  v0.13.0  ·  stages 0-6  ·  aarch64");
     println!("{}", RULE);
 
     let (kstart, kend) = unsafe {
@@ -223,7 +223,13 @@ pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
     // does not, and everything above works identically either way.
     if start_display_driver(&fdt) {
         println!("{}", RULE);
+        let ui = stage4_setup(&fdt);
         show_status_screen();
+        if ui {
+            println!("{}", RULE);
+            stage4_report();
+        }
+        display::shutdown();
     }
 
     println!("{}", RULE);
@@ -582,6 +588,13 @@ fn start_display_driver(fdt: &dtb::Fdt) -> bool {
 
     let req = ipc::create();
     let rep = ipc::create();
+
+    // The two application event channels are created now, before the server
+    // starts, because a capability cannot be handed to a process that is
+    // already running. Slots 5 and 6 are the only way it can reach a client.
+    let ev_shell = ipc::create();
+    let ev_notes = ipc::create();
+
     let caps = [
         cap::Cap::root(cap::Obj::Channel(req), cap::RIGHT_RECV),
         cap::Cap::root(cap::Obj::Channel(rep), cap::RIGHT_SEND),
@@ -591,6 +604,8 @@ fn start_display_driver(fdt: &dtb::Fdt) -> bool {
         ),
         cap::Cap::root(cap::Obj::Irq(found.node.irq), cap::RIGHT_IRQ),
         cap::Cap::root(cap::Obj::Dma { base: dma, pages: GPU_DMA_PAGES }, cap::RIGHT_MAP),
+        cap::Cap::root(cap::Obj::Channel(ev_shell), cap::RIGHT_SEND),
+        cap::Cap::root(cap::Obj::Channel(ev_notes), cap::RIGHT_SEND),
     ];
 
     irq::register_user(found.node.irq);
@@ -598,12 +613,85 @@ fn start_display_driver(fdt: &dtb::Fdt) -> bool {
 
     let pid = start_service("gpudrv", 9, &caps);
     display::attach(req, rep);
+    unsafe {
+        UI = Ui { req, ev_shell, ev_notes };
+    }
     println!(
-        "  display    : gpudrv is pid {}, {} KiB of framebuffer, same five capabilities",
+        "  display    : gpudrv is pid {}, {} KiB of framebuffer, {} capabilities",
         pid,
-        GPU_DMA_PAGES * mm::PAGE_SIZE / 1024
+        GPU_DMA_PAGES * mm::PAGE_SIZE / 1024,
+        caps.len()
     );
     true
+}
+
+/// Everything the display session is wired out of, kept so the input driver
+/// and the applications can be given capabilities to the same channels.
+#[derive(Clone, Copy)]
+struct Ui {
+    req: usize,
+    ev_shell: usize,
+    ev_notes: usize,
+}
+
+static mut UI: Ui = Ui { req: usize::MAX, ev_shell: usize::MAX, ev_notes: usize::MAX };
+
+/// One DMA page for the event queue's rings, one for the event buffers.
+const INPUT_DMA_PAGES: usize = 2;
+
+/// Hand the pointer to a userspace process. Four capabilities this time, not
+/// five: it has nothing to receive, so it is given no way to.
+fn start_input_driver(fdt: &dtb::Fdt) -> bool {
+    let ui = unsafe { UI };
+    if ui.req == usize::MAX {
+        return false;
+    }
+    let Some(found) = devices::find_virtio(fdt, devices::VIRTIO_INPUT) else {
+        println!("  input      : no pointer in any virtio transport");
+        return false;
+    };
+    println!(
+        "  bus        : input device in a virtio transport at {:#x}, intid {}",
+        found.node.base, found.node.irq
+    );
+    let Some(dma) = mm::frames::alloc_contiguous(INPUT_DMA_PAGES) else {
+        println!("  input      : no contiguous memory for the event queue");
+        return false;
+    };
+
+    let caps = [
+        cap::Cap::root(cap::Obj::Channel(ui.req), cap::RIGHT_SEND),
+        cap::Cap::root(
+            cap::Obj::Mmio { base: found.node.base as usize, size: found.node.size as usize },
+            cap::RIGHT_MAP,
+        ),
+        cap::Cap::root(cap::Obj::Irq(found.node.irq), cap::RIGHT_IRQ),
+        cap::Cap::root(cap::Obj::Dma { base: dma, pages: INPUT_DMA_PAGES }, cap::RIGHT_MAP),
+    ];
+
+    irq::register_user(found.node.irq);
+    gic::enable_spi(found.node.irq);
+
+    let pid = start_service("inputdrv", 10, &caps);
+    println!(
+        "  input      : inputdrv is pid {}, holding {} capabilities:",
+        pid,
+        caps.len()
+    );
+    for (i, c) in caps.iter().enumerate() {
+        println!("    slot {}     #{} {} ({})", i, c.id, c.obj_str(), c.rights_str());
+    }
+    true
+}
+
+/// Start an application: two capabilities, and that is the whole of it.
+fn start_app(name: &'static str, role: usize, events: usize) -> usize {
+    let ui = unsafe { UI };
+    let caps = [
+        cap::Cap::root(cap::Obj::Channel(ui.req), cap::RIGHT_SEND),
+        cap::Cap::root(cap::Obj::Channel(events), cap::RIGHT_RECV),
+    ];
+    start_service(name, role, &caps)
 }
 
 // ---------------------------------------------------------------------------
@@ -1365,7 +1453,116 @@ fn show_status_screen() {
     }
 
     println!("  display    : {} frames rendered by the userspace driver", display::frames());
-    display::shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Stage 4a exit test: two applications, one pointer, and a tap that goes to
+// exactly one of them.
+//
+// Stage 4 in full is a display server, GPU acceleration, text layout and a
+// shell on real hardware, and it is years away. What is reachable now is the
+// part that decides whether any of that would be trustworthy: who owns a
+// window, who a tap belongs to, and whether an application can reach past the
+// two capabilities it holds. That is what this tests.
+//
+// The claims, each of which fails loudly:
+//
+//   - a tap goes to the topmost window containing the point, and to nothing
+//     else;
+//   - the same point goes to a *different* application after the one
+//     underneath is raised;
+//   - a tap outside every window is delivered nowhere rather than to the last
+//     window that asked;
+//   - an application naming a window it does not own is refused, and the
+//     window does not move;
+//   - only the damaged rectangle is transferred to the device.
+
+fn stage4_setup(fdt: &dtb::Fdt) -> bool {
+    let ui = unsafe { UI };
+    if ui.req == usize::MAX {
+        return false;
+    }
+    let has_input = start_input_driver(fdt);
+
+    let shell = start_app("shell", 11, ui.ev_shell);
+    let notes = start_app("notes", 12, ui.ev_notes);
+
+    // The order matters and is the whole of the pairing: the server matches
+    // each introduction with its next unused client capability. It never
+    // learns a pid any other way, so a process cannot introduce itself.
+    display::introduce(shell);
+    display::introduce(notes);
+    println!(
+        "  ui         : shell is pid {} (2 capabilities), notes is pid {} (2 capabilities)",
+        shell, notes
+    );
+
+    // Open the windows one at a time, waiting for each to exist before asking
+    // for the next. Two processes on four cores would otherwise decide the
+    // stacking order between themselves, and stacking order is what this
+    // test is about.
+    display::start_app_window(ui.ev_shell);
+    if !display::wait_for_windows(1, 200) {
+        println!("  ui         : the shell never opened its window");
+        return false;
+    }
+    display::start_app_window(ui.ev_notes);
+    if !display::wait_for_windows(2, 200) {
+        println!("  ui         : notes never opened its window");
+        return false;
+    }
+    println!("  ui         : 2 windows open, notes on top of the shell where they overlap");
+
+    if has_input {
+        println!("  ui         : ready for input");
+    } else {
+        println!("  ui         : no pointer on this machine; windows only");
+    }
+    has_input
+}
+
+fn stage4_report() {
+    // The applications and the server run on their own; this waits for the
+    // taps to have been dealt with rather than for a fixed time, and gives up
+    // rather than hanging if nothing ever arrives.
+    let deadline = time::ticks() + 400;
+    let mut stats = display::ServerStats::default();
+    while time::ticks() < deadline {
+        if let Some(st) = display::server_stats() {
+            stats = st;
+            if st.taps_routed >= 3 && st.taps_on_nothing >= 1 && st.rejected >= 1 {
+                break;
+            }
+        }
+        sched::sleep_ticks(10);
+    }
+    let (routed, nowhere, rejected) =
+        (stats.taps_routed, stats.taps_on_nothing, stats.rejected);
+
+    println!();
+    println!("  taps       : {} routed to a window, {} landed on nothing", routed, nowhere);
+    println!(
+        "  ownership  : {} operation(s) named a window the sender does not own, all refused",
+        rejected
+    );
+    display::request_stats();
+
+    println!();
+    if routed >= 3 && nowhere >= 1 && rejected >= 1 {
+        println!("  RESULT     : PASS — every tap reached exactly one window, the same point");
+        println!("               went to a different application once the one underneath was");
+        println!("               raised, a tap outside every window reached nobody, and an");
+        println!("               application could not touch a window it did not create");
+    } else if routed == 0 {
+        println!("  RESULT     : NO INPUT — the pointer is attached but nothing touched it");
+        println!("               (./sim.sh --gui to tap it yourself, ./tools/uitest.sh to");
+        println!("               drive it from the host)");
+    } else {
+        println!(
+            "  RESULT     : FAIL — {} taps routed, {} on nothing, {} refused",
+            routed, nowhere, rejected
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
