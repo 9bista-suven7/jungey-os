@@ -33,6 +33,14 @@
 use crate::blk::{self, SECTOR_SIZE};
 
 const SB_SECTOR: u64 = 0;
+
+/// Sectors reserved at the top of the disk for the KV cache to spill into.
+///
+/// Carved out explicitly and recorded in the superblock, so the log *refuses*
+/// to grow into it. The alternative — assuming the log will never get that far
+/// — is exactly the assumption that had an earlier version of this project
+/// quietly overwriting its own model file.
+const SPILL_SECTORS: u64 = 16 * 1024; // 8 MiB
 const CP_SECTORS: [u64; 2] = [1, 2];
 pub const TEST_STATE_SECTOR: u64 = 4;
 const LOG_START: u64 = 8;
@@ -174,6 +182,9 @@ impl Checkpoint {
 
 pub struct Fs {
     pub cp: Checkpoint,
+    /// First sector of the reserved spill region: the log stops here.
+    pub spill_start: u64,
+    pub spill_sectors: u64,
     /// Which checkpoint slot the live root is in. The next commit writes the
     /// other one, so a torn write can never damage the root we booted from.
     pub slot: usize,
@@ -186,8 +197,11 @@ pub fn format(total_sectors: u64) -> Result<(), &'static str> {
     put_u64(&mut sb, 0, SB_MAGIC);
     put_u32(&mut sb, 8, 1); // version
     put_u64(&mut sb, 12, total_sectors);
+    let spill_start = total_sectors - SPILL_SECTORS;
     put_u64(&mut sb, 20, LOG_START);
-    put_u64(&mut sb, 28, total_sectors - LOG_START);
+    put_u64(&mut sb, 28, spill_start - LOG_START);
+    put_u64(&mut sb, 36, spill_start);
+    put_u64(&mut sb, 44, SPILL_SECTORS);
     seal(&mut sb);
     blk::write_sector(SB_SECTOR, &sb)?;
 
@@ -210,6 +224,8 @@ pub fn mount() -> Result<Fs, &'static str> {
         return Err("superblock checksum mismatch");
     }
     let total_sectors = get_u64(&sb, 12);
+    let spill_start = get_u64(&sb, 36);
+    let spill_sectors = get_u64(&sb, 44);
 
     let mut best: Option<(usize, Checkpoint)> = None;
     for (i, &sector) in CP_SECTORS.iter().enumerate() {
@@ -226,7 +242,7 @@ pub fn mount() -> Result<Fs, &'static str> {
     }
 
     let (slot, cp) = best.ok_or("no valid checkpoint: filesystem is unrecoverable")?;
-    Ok(Fs { cp, slot, total_sectors })
+    Ok(Fs { cp, slot, total_sectors, spill_start, spill_sectors })
 }
 
 impl Fs {
@@ -277,7 +293,9 @@ impl Fs {
         }
         let sectors = data.len().div_ceil(SECTOR_SIZE) as u32;
         let start = self.cp.log_head;
-        if start + sectors as u64 > self.total_sectors {
+        // The log stops at the spill region rather than at the end of the
+        // disk: another subsystem owns those sectors.
+        if start + sectors as u64 > self.spill_start {
             return Err("log is full");
         }
 

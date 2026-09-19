@@ -64,12 +64,15 @@ for round in $(seq 1 "$REPEAT"); do
     check "undeliverable work refused"   1 "$LOG_DIR/boot1" "refused, as it should be — the app"
     check "opportunistic waited"         1 "$LOG_DIR/boot1" "opportunistic work waited for an idle"
     check "scheduler result"             1 "$LOG_DIR/boot1" "RESULT     : PASS — interactive work preempted"
+    check "kv spilled under pressure"    1 "$LOG_DIR/boot1" "blocks spilled to flash"
+    check "kv survived the flash trip"   1 "$LOG_DIR/boot1" "every byte survived the round trip"
+    check "kv policy correct"            1 "$LOG_DIR/boot1" "RESULT     : PASS — the budget held"
     check "model file verified on disk"  1 "$LOG_DIR/boot1" "verified on disk"
     check "weights shared, not copied"   1 "$LOG_DIR/boot1" "one copy of the weights"
     check "reclaimed pages re-faulted"   2 "$LOG_DIR/boot1" "0 wrong after"
     check "no kernel panic"              0 "$LOG_DIR/boot1" "KERNEL PANIC"
     check "no wait timed out"            0 "$LOG_DIR/boot1" "TIMEOUT"
-    check "boot ran to completion"       1 "$LOG_DIR/boot1" "stage 5b complete"
+    check "boot ran to completion"       1 "$LOG_DIR/boot1" "stage 5c complete"
 
     echo "boot 2 — verify v1, then lose power part way through the data"
     check "sector survived the reboot"   1 "$LOG_DIR/boot2" "previous   : boot 1"
@@ -98,7 +101,7 @@ for round in $(seq 1 "$REPEAT"); do
     check "no kernel panic"              0 "$LOG_DIR/boot5" "KERNEL PANIC"
     check "no wait timed out"            0 "$LOG_DIR/boot5" "TIMEOUT"
     check "scheduler still correct"      1 "$LOG_DIR/boot5" "RESULT     : PASS — interactive work preempted"
-    check "boot ran to completion"       1 "$LOG_DIR/boot5" "stage 5b complete"
+    check "boot ran to completion"       1 "$LOG_DIR/boot5" "stage 5c complete"
 done
 
 echo

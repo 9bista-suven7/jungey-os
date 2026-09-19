@@ -22,6 +22,7 @@ pub mod exceptions;
 pub mod fs;
 pub mod gic;
 pub mod ipc;
+pub mod kv;
 pub mod irq;
 pub mod mm;
 pub mod model;
@@ -73,7 +74,7 @@ const RULE: &str = "  ----------------------------------------------------------
 #[no_mangle]
 pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
     println!("{}", BANNER);
-    println!("  Jungey OS  v0.9.0  ·  stage 5b  ·  aarch64");
+    println!("  Jungey OS  v0.10.0  ·  stage 5c  ·  aarch64");
     println!("{}", RULE);
 
     let (kstart, kend) = unsafe {
@@ -206,6 +207,9 @@ pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
     println!("{}", RULE);
     stage5b_demo();
     heap_check("after stage 5b");
+    println!("{}", RULE);
+    stage5c_demo();
+    heap_check("after stage 5c");
 
     // A screen, if the machine has one. `sim.sh` attaches a display; `run.sh`
     // does not, and everything above works identically either way.
@@ -223,7 +227,7 @@ pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
             blk::stale_replies()
         );
     }
-    println!("  stage 5b complete.");
+    println!("  stage 5c complete.");
 
     // The demos are the kernel's whole job right now, so stopping the machine
     // when they finish beats idling forever: `./run.sh` returns, and a stress
@@ -1354,6 +1358,143 @@ fn show_status_screen() {
 
     println!("  display    : {} frames rendered by the userspace driver", display::frames());
     display::shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Stage 5c exit test: more conversations than fit; the right blocks are
+// evicted; a spilled session restores and its contents are unchanged.
+//
+// The claim is ARCHITECTURE.md section 3.2's other half — that a KV cache is an
+// OS-managed, evictable tier rather than memory an inference library allocates
+// and never gives back. Two things follow that a library cannot do: a dropped
+// block is written to flash first, because unlike weights it cannot be
+// regenerated; and eviction knows a conversation's prefix is worth more than
+// its middle, because the prefix is re-read on every turn.
+// ---------------------------------------------------------------------------
+
+const KV_SESSIONS: usize = 4;
+const KV_BLOCKS_EACH: usize = 20;
+
+fn stage5c_demo() {
+    if !blk::attached() {
+        println!("  kv         : no disk to spill to, skipping");
+        return;
+    }
+    let Ok(f) = mounted() else { return };
+    kv::init(f.spill_start, f.spill_sectors);
+    println!(
+        "  kv         : budget {} blocks ({} KiB), spill region {} sectors from {}",
+        kv::BUDGET_BLOCKS,
+        kv::BUDGET_BLOCKS * kv::BLOCK_BYTES / 1024,
+        f.spill_sectors,
+        f.spill_start
+    );
+
+    // ---- fill past the budget ----
+    let mut ids = alloc::vec::Vec::new();
+    for _ in 0..KV_SESSIONS {
+        let id = kv::open(usize::MAX, 1);
+        ids.push(id);
+        match kv::append(id, KV_BLOCKS_EACH) {
+            Ok(_) => {}
+            Err(e) => {
+                println!("  kv         : append failed — {}", e);
+                return;
+            }
+        }
+        // Let the clock move, so sessions differ in age and recency means
+        // something to the policy.
+        sched::sleep_ticks(2);
+    }
+    let asked = KV_SESSIONS * KV_BLOCKS_EACH;
+    let (resident, budget, evictions, _, prefix_evictions) = kv::totals();
+    println!();
+    println!(
+        "  filled     : {} sessions x {} blocks = {} asked for, budget is {}",
+        KV_SESSIONS, KV_BLOCKS_EACH, asked, budget
+    );
+    println!("    resident   : {} blocks — the budget held", resident);
+    println!("    evicted    : {} blocks spilled to flash", evictions);
+    println!("    of those   : {} were prefix blocks", prefix_evictions);
+
+    println!();
+    println!("    session  blocks  resident  spilled  prefix resident");
+    kv::for_each(|s| {
+        println!(
+            "    {:>7}  {:>6}  {:>8}  {:>7}  {:>9}/4",
+            s.id,
+            s.blocks(),
+            s.resident(),
+            s.spilled(),
+            s.prefix_resident()
+        );
+    });
+
+    // ---- read everything back and check it ----
+    let mut wrong = 0usize;
+    let mut checked = 0usize;
+    let mut buf = alloc::vec![0u8; kv::BLOCK_BYTES];
+    for &id in ids.iter() {
+        for index in 0..KV_BLOCKS_EACH {
+            match kv::read(id, index, &mut buf) {
+                Ok(_) => {
+                    // Check the whole block, not a sample: a spill-and-restore
+                    // that loses a sector in the middle would pass a spot check.
+                    for (o, b) in buf.iter().enumerate() {
+                        if *b != kv::pattern(id, index, o) {
+                            wrong += 1;
+                        }
+                        checked += 1;
+                    }
+                }
+                Err(e) => {
+                    println!("  kv         : read of session {} block {} failed — {}", id, index, e);
+                    return;
+                }
+            }
+        }
+    }
+    let (_, _, evictions, restores, _) = kv::totals();
+    println!();
+    println!("  read back  : {} bytes checked across {} blocks", checked, asked);
+    if wrong == 0 {
+        println!("    integrity  : PASS — every byte survived the round trip to flash");
+    } else {
+        println!("    integrity  : FAIL — {} bytes differ", wrong);
+    }
+    println!("    restores   : {} blocks fetched back from flash", restores);
+    println!("    evictions  : {} in total", evictions);
+
+    // ---- now make prefixes alone exceed the budget ----
+    //
+    // The prefix discount is a discount, not a pin: with enough conversations
+    // open, even prefixes have to go. A policy that could never evict them
+    // would deadlock the cache instead of degrading.
+    let before = kv::totals().4;
+    for _ in 0..20 {
+        let id = kv::open(usize::MAX, 1);
+        if kv::append(id, 4).is_err() {
+            break;
+        }
+    }
+    let (resident, _, _, _, prefix_evictions) = kv::totals();
+    println!();
+    println!("  pressure   : 20 more conversations, 4 blocks each — prefixes alone now exceed the budget");
+    println!("    resident   : {} blocks", resident);
+    println!("    prefix out : {} prefix blocks evicted ({} before)", prefix_evictions, before);
+
+    let policy_ok = before == 0 && prefix_evictions > 0;
+    println!();
+    if wrong == 0 && evictions > 0 && restores > 0 && policy_ok && resident <= kv::BUDGET_BLOCKS {
+        println!("  RESULT     : PASS — the budget held, the middle of a conversation was");
+        println!("               spilled before its prefix, everything came back byte for byte,");
+        println!("               and prefixes yielded only once they alone would not fit");
+    } else {
+        println!(
+            "  RESULT     : FAIL — wrong {}, evictions {}, restores {}, prefix-before {}, prefix-after {}, resident {}",
+            wrong, evictions, restores, before, prefix_evictions, resident
+        );
+    }
 }
 
 fn current_el() -> u64 {
