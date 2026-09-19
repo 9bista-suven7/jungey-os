@@ -21,6 +21,24 @@ pub const CAP_SLOTS: usize = 8;
 const USER_STACK_TOP: usize = 0x0000_0000_7000_0000;
 const USER_STACK_PAGES: usize = 4;
 
+/// What a range of a process's address space is for.
+///
+/// The kernel needs this to answer a page fault with something other than
+/// killing the process: a fault inside a model mapping is not an error, it is
+/// the request for a page.
+#[derive(Clone, Copy)]
+pub enum VmaKind {
+    /// Pages of a model object, shared with every other process mapping it.
+    Model { id: u64 },
+}
+
+#[derive(Clone, Copy)]
+pub struct Vma {
+    pub start: usize,
+    pub pages: usize,
+    pub kind: VmaKind,
+}
+
 pub struct Process {
     pub pid: usize,
     pub name: &'static str,
@@ -34,6 +52,8 @@ pub struct Process {
     /// Interrupts this process has already been told about. One counter,
     /// because a process holds one `Irq` capability at this stage.
     pub irq_seen: u64,
+    /// Regions that fault in on demand rather than up front.
+    pub vmas: Vec<Vma>,
 }
 
 /// Processes are leaked for the lifetime of the kernel; reaping arrives with
@@ -66,6 +86,7 @@ pub fn create(name: &'static str, image: &[u8], arg: usize) -> Result<usize, &'s
         arg,
         exit_code: None,
         irq_seen: 0,
+        vmas: Vec::new(),
     })));
     Ok(pid)
 }
@@ -143,5 +164,23 @@ pub fn for_each(mut f: impl FnMut(&Process)) {
     let table = TABLE.lock();
     for &p in table.0.iter() {
         f(unsafe { &*p });
+    }
+}
+
+/// Record a demand-paged region.
+pub fn add_vma(pid: usize, vma: Vma) {
+    if let Some(p) = get(pid) {
+        unsafe { (*p).vmas.push(vma) };
+    }
+}
+
+/// Which region, if any, covers `va`.
+pub fn find_vma(pid: usize, va: usize) -> Option<Vma> {
+    let p = get(pid)?;
+    unsafe {
+        (*p).vmas
+            .iter()
+            .find(|v| va >= v.start && va < v.start + v.pages * crate::mm::PAGE_SIZE)
+            .copied()
     }
 }

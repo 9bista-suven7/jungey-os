@@ -12,6 +12,13 @@ Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and
 
 ## Status
 
+**Stage 5a — weights are a kernel object.** A model is content-addressed, so two
+processes opening the same bytes get one object and one copy of the pages;
+demand-paged, so mapping it is instant and pages arrive as they are touched; and
+reclaimable, because every resident page is clean by construction. Two processes
+sharing a model read it from flash once, not twice, and dropping half its pages
+under memory pressure is invisible to both.
+
 **Stage 3 complete — the disk is driven from outside the kernel.** `Mmio`, `Irq`
 and `Dma` are capability objects, so a driver is an ordinary process: the
 virtio-blk driver holds five capabilities and has no way to reach anything else.
@@ -141,9 +148,21 @@ first; see `docs/ROADMAP.md` for those):
   log        : 3 sectors used, 0 garbage — both crashes cost no space
   write      : hello.txt v2 committed, checkpoint seq 3
   ----------------------------------------------------------
-  [blkdrv  ] shutting down after 15 device interrupts
-  driver     : 17 requests served by the userspace driver
-  stage 3d complete.
+  ----------------------------------------------------------
+  model      : verified on disk, all 65536 bytes
+  model      : model.bin published, 65536 bytes, 16 pages, at sector 11
+
+  after pass 1 — both processes have touched every page:
+    faults       : 32 across both processes, for a 16-page model
+    shared       : 16 served from a page another process had already read
+    read         : 16 pages came off flash; two private copies would have read 32
+    resident     : 16 pages of weights in memory
+    RESULT       : PASS — one copy of the weights, two processes using it
+
+  reclaimed    : 8 of 16 pages dropped under pressure
+  [modelA  ] pass 2: 128 bytes checked, 0 wrong after 8 pages were reclaimed
+  ----------------------------------------------------------
+  stage 5a complete.
   powering off via psci.
 ```
 
@@ -201,6 +220,16 @@ Read that output as a set of claims, each of which fails loudly if broken:
   `devices.rs` say what kind of device is in each slot. That is bus
   enumeration; there is no virtqueue or block-protocol code anywhere in
   `kernel/`.
+
+**Model store (stage 5a)**
+
+- **One copy, two processes.** 32 faults across both, 16 pages read from flash.
+  Two private copies would have read 32.
+- **Nothing is resident until it is touched.** Mapping a model is instant; the
+  pages arrive as page faults, answered from disk.
+- **Reclaim is invisible.** Half the pages are dropped under simulated
+  pressure, and both processes re-read them without noticing and without a
+  single wrong byte.
 
 The kernel powers off through PSCI when it finishes, so `./run.sh` returns
 rather than idling forever.
@@ -262,6 +291,7 @@ os/
         ├── devices.rs        bus enumeration — what is in each slot
         ├── blk.rs            block storage, as a client of a driver process
         ├── fs.rs             JLFS: append-only log, two checkpoint slots
+        ├── model.rs          the model store: shared, paged, reclaimable weights
         ├── dtb.rs            flattened device tree reader
         ├── cap.rs            capabilities: minting, derivation, revocation
         ├── ipc.rs            channels and message queues
@@ -335,9 +365,14 @@ the higher half.
   to a Rust type must not be able to change what is on someone's disk.
 - **A test that has to survive a broken filesystem cannot live inside it.** The
   crash test's phase marker sits in its own sector, outside JLFS entirely.
-- **Blocking is two steps.** `prepare_block`, re-check the condition, then
-  `block` or `cancel_block`. Checking first and blocking second loses any wakeup
-  that lands in between, and the thread waits forever for a second one.
+- **A receiver marks itself blocked while still holding the channel lock.**
+  Checking the queue and then blocking leaves a window in which a sender wakes a
+  thread that is not yet waiting; the message then sits unread until someone
+  sends another. Narrowing that window is not enough — it has to be closed by
+  construction.
+- **Every request carries a tag.** A request that times out still gets a reply
+  eventually, and without a tag the next request takes that as its own — after
+  which every answer is one behind.
 - **Syscalls run with interrupts enabled.** Exception entry masks them in
   hardware; a syscall that waits with them masked stops its core's timer, and
   every deadline in the system becomes infinite.

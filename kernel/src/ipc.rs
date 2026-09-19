@@ -44,6 +44,29 @@ pub fn send(channel: usize, from: usize, bytes: Vec<u8>) -> Result<usize, &'stat
     Ok(len)
 }
 
+/// Take a message, or mark the caller blocked — atomically, with respect to any
+/// sender.
+///
+/// The two-step `prepare_block` / check / `block` discipline is not enough on
+/// its own: between releasing the channel and marking oneself blocked there is
+/// still a window, and a sender landing in it wakes a thread that is not yet
+/// waiting. The wake is lost and the receiver sleeps with its message already
+/// queued — for as long as it takes someone to send a *second* one.
+///
+/// Marking blocked while still holding the channel closes it by construction. A
+/// sender has to take the same lock to enqueue, so it either enqueues first —
+/// and we see the message — or it finds us already blocked and wakes us.
+pub fn recv_or_prepare(channel: usize, token: u64) -> Option<Message> {
+    let mut chans = CHANNELS.lock();
+    let ch = chans.get_mut(channel)?;
+    if let Some(m) = ch.queue.pop_front() {
+        ch.received += 1;
+        return Some(m);
+    }
+    crate::sched::prepare_block(token);
+    None
+}
+
 pub fn try_recv(channel: usize) -> Option<Message> {
     let mut chans = CHANNELS.lock();
     let ch = chans.get_mut(channel)?;

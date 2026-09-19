@@ -9,7 +9,7 @@ use crate::mm::paging::Perm;
 use crate::mm::PAGE_SIZE;
 use crate::exceptions::TrapFrame;
 use crate::mm::uaccess;
-use crate::{gic, ipc, irq, proc, sched, time};
+use crate::{gic, ipc, irq, model, proc, sched, time};
 
 pub const SYS_EXIT: u64 = 0;
 pub const SYS_WRITE: u64 = 1;
@@ -22,6 +22,9 @@ pub const SYS_SLEEP: u64 = 7;
 pub const SYS_MAP_DEVICE: u64 = 8;
 pub const SYS_DMA_MAP: u64 = 9;
 pub const SYS_IRQ_WAIT: u64 = 10;
+pub const SYS_MODEL_OPEN: u64 = 11;
+pub const SYS_MODEL_MAP: u64 = 12;
+pub const SYS_MODEL_INFO: u64 = 13;
 
 pub const EBADCAP: isize = -1;
 pub const EPERM: isize = -2;
@@ -63,6 +66,9 @@ pub fn dispatch(frame: &mut TrapFrame) {
         SYS_MAP_DEVICE => sys_map_device(pid, a, b),
         SYS_DMA_MAP => sys_dma_map(pid, a, b),
         SYS_IRQ_WAIT => sys_irq_wait(pid, a, b as u64),
+        SYS_MODEL_OPEN => sys_model_open(pid, a, b),
+        SYS_MODEL_MAP => sys_model_map(pid, a as u64, b),
+        SYS_MODEL_INFO => sys_model_info(pid, a as u64, b),
         _ => EINVAL,
     };
 
@@ -129,7 +135,11 @@ fn sys_recv(pid: usize, slot: usize, ptr: usize, len: usize) -> isize {
         let Some(channel) = cap.channel() else {
             return EINVAL;
         };
-        if let Some(msg) = ipc::try_recv(channel) {
+        // Take a message, or become a waiter, with no gap between the two: see
+        // `ipc::recv_or_prepare`. Checking the queue and then marking oneself
+        // blocked leaves a window in which a sender wakes a thread that is not
+        // yet waiting, and the message sits unread until someone sends another.
+        if let Some(msg) = ipc::recv_or_prepare(channel, channel as u64) {
             let n = msg.bytes.len().min(len);
             let Some(Ok(())) = with_space(pid, |s| uaccess::copy_to_user(s, ptr, &msg.bytes[..n]))
             else {
@@ -138,7 +148,7 @@ fn sys_recv(pid: usize, slot: usize, ptr: usize, len: usize) -> isize {
             return n as isize;
         }
 
-        sched::block_on(channel as u64);
+        sched::block(channel as u64);
     }
 }
 
@@ -240,5 +250,76 @@ fn sys_irq_wait(pid: usize, slot: usize, timeout: u64) -> isize {
             return ETIMEDOUT;
         }
         sched::yield_now();
+    }
+}
+
+/// Open a model by name. Returns its id.
+fn sys_model_open(pid: usize, ptr: usize, len: usize) -> isize {
+    if len > 64 {
+        return EINVAL;
+    }
+    let Some(Ok(bytes)) = with_space(pid, |s| uaccess::copy_from_user(s, ptr, len)) else {
+        return EFAULT;
+    };
+    let Ok(name) = core::str::from_utf8(&bytes) else {
+        return EINVAL;
+    };
+    match model::open_by_name(name) {
+        Ok(id) => id as isize,
+        Err(e) => {
+            crate::println!("  model      : open of \"{}\" failed — {}", name, e);
+            EBADCAP
+        }
+    }
+}
+
+/// Map a model at `uva`. Returns its size in bytes.
+///
+/// Nothing is resident afterwards. The pages arrive as the process touches
+/// them, which is what makes a multi-gigabyte model start in milliseconds
+/// instead of seconds.
+fn sys_model_map(pid: usize, id: u64, uva: usize) -> isize {
+    if uva % PAGE_SIZE != 0 {
+        return EINVAL;
+    }
+    match model::attach(id, pid, uva) {
+        Ok(size) => {
+            proc::add_vma(
+                pid,
+                proc::Vma {
+                    start: uva,
+                    pages: size.div_ceil(PAGE_SIZE),
+                    kind: proc::VmaKind::Model { id },
+                },
+            );
+            size as isize
+        }
+        Err(_) => EBADCAP,
+    }
+}
+
+/// Write eight u64s about a model to `out`: id, hash, size, resident pages,
+/// total pages, faults, pages reclaimed, reference count.
+fn sys_model_info(pid: usize, id: u64, out: usize) -> isize {
+    let Some(st) = model::stat(id) else {
+        return EBADCAP;
+    };
+    let vals = [
+        st.0,
+        st.1,
+        st.2 as u64,
+        st.3 as u64,
+        st.4 as u64,
+        st.5,
+        st.6,
+        st.7 as u64,
+    ];
+    let mut bytes = [0u8; 64];
+    for (i, v) in vals.iter().enumerate() {
+        bytes[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    match with_space(pid, |s| uaccess::copy_to_user(s, out, &bytes)) {
+        Some(Ok(())) => 0,
+        _ => EFAULT,
     }
 }

@@ -149,6 +149,29 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Remove `pages` mappings at `va`. The frames themselves are not freed —
+    /// whoever owns them decides that, which for shared weight pages is the
+    /// model store rather than any one address space.
+    pub fn unmap(&mut self, va: usize, pages: usize) {
+        for i in 0..pages {
+            let addr = va + i * PAGE_SIZE;
+            let mut table = phys_to_virt(self.root) as *mut u64;
+            let mut ok = true;
+            for level in 0..3 {
+                let e = unsafe { *table.add(index(addr, level)) };
+                if e & PTE_VALID == 0 {
+                    ok = false;
+                    break;
+                }
+                table = phys_to_virt((e & ADDR_MASK) as usize) as *mut u64;
+            }
+            if ok {
+                unsafe { *table.add(index(addr, 3)) = 0 };
+            }
+        }
+        self.flush();
+    }
+
     /// Physical address backing a user virtual address, if it is mapped.
     pub fn translate(&self, va: usize) -> Option<usize> {
         let mut table = phys_to_virt(self.root) as *const u64;

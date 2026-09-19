@@ -98,6 +98,10 @@ pub struct Thread {
     pub on_cpu: Option<usize>,
     /// Pinned to one core. Only idle threads use this.
     pub affinity: Option<usize>,
+    /// A long-running service rather than a job. Services are not counted as
+    /// live work: a driver that sits waiting for requests has not failed to
+    /// finish, it is doing exactly what it is for.
+    pub service: bool,
     /// Bitmask of cores this thread has ever run on. Proof of migration.
     pub cpus_seen: u64,
     /// The process this thread runs for, if it is a user thread.
@@ -133,6 +137,7 @@ pub fn init() {
         slices: 1,
         on_cpu: Some(0),
         affinity: None,
+        service: false,
         cpus_seen: 1,
         pid: None,
         ttbr0: crate::mm::paging::empty_ttbr0(),
@@ -179,6 +184,7 @@ pub fn adopt_as_idle(cpu_id: usize) {
         slices: 1,
         on_cpu: Some(cpu_id),
         affinity: Some(cpu_id),
+        service: false,
         cpus_seen: 1 << cpu_id,
         pid: None,
         ttbr0: crate::mm::paging::empty_ttbr0(),
@@ -202,6 +208,14 @@ pub fn spawn(name: &'static str, entry: fn(usize), arg: usize) -> Option<usize> 
 /// Create a thread that will not run until `start` is called.
 pub fn spawn_stopped(name: &'static str, entry: fn(usize), arg: usize) -> Option<usize> {
     spawn_pinned(name, entry, arg, None)
+}
+
+/// Mark a thread as a long-running service, so it is not counted as live work.
+pub fn mark_service(tid: usize) {
+    let s = SCHED.lock();
+    if let Some(&t) = s.threads.get(tid) {
+        unsafe { (*t).service = true };
+    }
 }
 
 /// Release a thread created by `spawn_stopped` into the run queue.
@@ -235,6 +249,7 @@ fn spawn_pinned(
         slices: 0,
         on_cpu: None,
         affinity,
+        service: false,
         cpus_seen: 0,
         pid: None,
         ttbr0: crate::mm::paging::empty_ttbr0(),
@@ -500,7 +515,9 @@ pub fn live_count() -> usize {
     let s = SCHED.lock();
     s.threads
         .iter()
-        .filter(|&&t| unsafe { (*t).affinity.is_none() && (*t).state != State::Finished })
+        .filter(|&&t| unsafe {
+            (*t).affinity.is_none() && !(*t).service && (*t).state != State::Finished
+        })
         .count()
 }
 
@@ -509,5 +526,30 @@ pub fn for_each(mut f: impl FnMut(&Thread)) {
     let s = SCHED.lock();
     for &t in s.threads.iter() {
         f(unsafe { &*t });
+    }
+}
+
+/// Print every thread's scheduling state. For working out why something is not
+/// running, which is otherwise close to unanswerable from the outside.
+pub fn dump(tag: &str) {
+    let s = SCHED.lock();
+    crate::println!("  sched dump ({}):", tag);
+    for &t in s.threads.iter() {
+        unsafe {
+            crate::println!(
+                "    {:<10} {:<9} on_cpu {:?} slices {} service {}",
+                (*t).name,
+                match (*t).state {
+                    State::Blocked(tok) => {
+                        crate::println!("      (blocked on token {})", tok);
+                        "blocked"
+                    }
+                    other => other.label(),
+                },
+                (*t).on_cpu,
+                (*t).slices,
+                (*t).service
+            );
+        }
     }
 }

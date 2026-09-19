@@ -405,19 +405,102 @@ have budgeted for.*
 
 ---
 
-## Stage 5 — The inference stack  ← *the reason this project exists*
+## Stage 5 — The inference stack  🔶 *in progress* ← *the reason this project exists*
 
-The tensor scheduler, the model store, quantized kernels (start CPU NEON/SME,
-then the NPU), a graph executor with segment-level preemption, KV-cache tiering,
-and the energy budget accounting. First real model running on device under
-scheduler control.
+Split the way stage 3 was, because the whole thing is too big to verify at once.
 
-**Exit test:** a 3B model generates tokens while a second `interactive` job
-preempts it mid-generation and meets a 50 ms deadline, with both jobs' joule
-consumption reported accurately.
+### 5a — Model store  ✅ *done*
 
-*Cost: 6–12 months. The scheduler is the novel part; the kernels are a known
-quantity you can borrow from llama.cpp/MLC.*
+Weights as a kernel object: content-addressed so identical bytes are one
+object however they were named, demand-paged so a model starts in milliseconds
+rather than after a blocking read, and reclaimable because every resident page
+is clean by construction.
+
+**Exit test:** two processes map the same model; the weights are read from flash
+once, not twice; dropping half the pages under pressure is invisible to both,
+and re-reading them returns the same bytes. ✅
+
+```
+  model      : verified on disk, all 65536 bytes
+  model      : model.bin published, 65536 bytes, 16 pages, at sector 11
+
+  after pass 1 — both processes have touched every page:
+    faults       : 32 across both processes, for a 16-page model
+    shared       : 16 served from a page another process had already read
+    read         : 16 pages came off flash; two private copies would have read 32
+    resident     : 16 pages of weights in memory
+    RESULT       : PASS — one copy of the weights, two processes using it
+
+  reclaimed    : 8 of 16 pages dropped under pressure
+  [modelA  ] pass 2: 128 bytes checked, 0 wrong after 8 pages were reclaimed
+  [modelB  ] pass 2: 128 bytes checked, 0 wrong after 8 pages were reclaimed
+```
+
+The kernel gained real demand paging to do it: a translation fault from EL0 is
+now a request for a page rather than a death sentence, answered from a
+per-process list of regions. A page being read is marked `Loading`, so two cores
+faulting the same page do not both read it — on a real model that is a wasted
+megabyte, not a wasted page.
+
+**Three bugs, all of them the same shape — a race that only exists because a
+driver, a client and two model users now run at once on four cores:**
+
+- *A lost wakeup that survived one fix.* The receiver checked its channel, found
+  it empty, and then marked itself blocked; a sender landing in that window woke
+  a thread that was not yet waiting. The first fix — mark blocked, re-check,
+  then block — narrowed the window but did not close it, and in any case was
+  written and never wired up, which a careful reading of the file would have
+  caught sooner than three rounds of instrumentation did. The real fix is
+  structural: the receiver marks itself blocked *while holding the channel
+  lock*, so a sender must either enqueue first and be seen, or find the receiver
+  already waiting. One stall in five boots became none in fifteen.
+- *Block requests were not serialised.* Two threads sent on the same channel and
+  polled the same reply channel, taking each other's answers. It did not look
+  like a lock bug; it looked like the disk returning wrong data.
+- *A timed-out request left its reply behind.* The next request took that as its
+  own and every answer afterwards was one behind. Replies now carry the tag of
+  the request they answer, and a mismatched one is discarded.
+
+And one that was purely my own: the stage 3b persistence record lived at sector
+64, which is *inside* the filesystem's log. The test spent a boot corrupting the
+model file it had just written.
+
+**Deviations:**
+
+- *The model is a 64 KiB file of a known pattern*, not real weights. What is
+  being tested is sharing, demand paging and reclaim, none of which care what
+  the bytes mean.
+- *Reclaim is newest-first*, not a working-set or clock policy. Choosing well
+  needs a real access pattern to choose against.
+- *No KV cache tier yet* — that is 5c.
+
+### 5b — Tensor scheduler  ⬜
+
+QoS classes, admission against a deadline, segment-level preemption, per-job
+accounting.
+
+**Exit test:** a long background job is preempted mid-run by an interactive one
+that meets a 50 ms deadline, and both jobs' costs are attributed correctly.
+
+### 5c — KV cache tier  ⬜
+
+Per-session cache sized by the scheduler, evictable under pressure, spillable to
+flash, with a policy that knows a conversation's prefix is worth more than its
+middle.
+
+**Exit test:** more sessions than fit; the right ones are evicted; a spilled
+session restores and continues correctly.
+
+### 5d — Energy budgets  ⬜
+
+Joules per job and per class, thermal headroom as an admission input,
+`opportunistic` work as the elastic band.
+
+**Exit test:** opportunistic work is admitted only within budget and gives way
+when headroom disappears.
+
+*Cost: 6–12 months for the stage. The scheduler is the novel part; the kernels
+are a known quantity you can borrow from llama.cpp/MLC.*
 
 ---
 

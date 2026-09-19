@@ -104,6 +104,8 @@ struct Disk {
     last_used: u16,
     avail_idx: u16,
     interrupts: u64,
+    exhausted: u64,
+    timeouts: u64,
 }
 
 /// Buffer layout inside the second DMA page.
@@ -201,7 +203,7 @@ impl Disk {
 
             wr(STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
 
-            Some(Disk { dma_phys, capacity, last_used: 0, avail_idx: 0, interrupts: 0 })
+            Some(Disk { dma_phys, capacity, last_used: 0, avail_idx: 0, interrupts: 0, exhausted: 0, timeouts: 0 })
         }
     }
 
@@ -267,6 +269,9 @@ impl Disk {
                 return true;
             }
             let r = irq_wait(CAP_IRQ, 50);
+            if r < 0 {
+                self.timeouts += 1;
+            }
             if r > 0 {
                 self.interrupts = r as u64;
                 unsafe {
@@ -282,6 +287,7 @@ impl Disk {
             self.last_used = used;
             return true;
         }
+        self.exhausted += 1;
         false
     }
 }
@@ -305,32 +311,38 @@ pub fn run() {
         .x(disk.dma_phys)
         .nl();
 
-    let mut req = [0u8; 9 + SECTOR];
-    let mut rep = [0u8; 1 + SECTOR];
+    // `[op][tag:4][sector:8]`, then the data for a write.
+    const HEADER: usize = 13;
+    const REPLY_HEADER: usize = 5;
+    let mut req = [0u8; HEADER + SECTOR];
+    let mut rep = [0u8; REPLY_HEADER + SECTOR];
 
     loop {
         let n = match recv(CAP_REQ, &mut req) {
             Ok(n) => n,
             Err(_) => return,
         };
-        if n < 9 {
+        if n < HEADER {
             continue;
         }
         let op = req[0];
-        let sector = le64(&req[1..9]);
-        rep = [0u8; 1 + SECTOR];
+        // Echoed back so the client can tell this reply from a late one.
+        let tag = &req[1..5];
+        let sector = le64(&req[5..13]);
+        rep = [0u8; REPLY_HEADER + SECTOR];
+        rep[1..5].copy_from_slice(tag);
 
         match op {
             OP_INFO => {
                 rep[0] = 0;
-                rep[1..9].copy_from_slice(&disk.capacity.to_le_bytes());
-                let _ = send(CAP_REP, &rep[..9]);
+                rep[REPLY_HEADER..REPLY_HEADER + 8].copy_from_slice(&disk.capacity.to_le_bytes());
+                let _ = send(CAP_REP, &rep[..REPLY_HEADER + 8]);
             }
             OP_READ => {
                 let mut data = [0u8; SECTOR];
                 if disk.request(BLK_T_IN, sector, &mut data) {
                     rep[0] = 0;
-                    rep[1..].copy_from_slice(&data);
+                    rep[REPLY_HEADER..].copy_from_slice(&data);
                 } else {
                     rep[0] = 1;
                 }
@@ -338,23 +350,27 @@ pub fn run() {
             }
             OP_WRITE => {
                 let mut data = [0u8; SECTOR];
-                data.copy_from_slice(&req[9..9 + SECTOR]);
+                data.copy_from_slice(&req[HEADER..HEADER + SECTOR]);
                 rep[0] = if disk.request(BLK_T_OUT, sector, &mut data) { 0 } else { 1 };
-                let _ = send(CAP_REP, &rep[..1]);
+                let _ = send(CAP_REP, &rep[..REPLY_HEADER]);
             }
             OP_SHUTDOWN => {
                 Line::new()
                     .s("  [blkdrv  ] shutting down after ")
                     .d(disk.interrupts as usize)
-                    .s(" device interrupts")
+                    .s(" device interrupts, ")
+                    .d(disk.timeouts as usize)
+                    .s(" irq timeouts, ")
+                    .d(disk.exhausted as usize)
+                    .s(" requests given up on")
                     .nl();
                 rep[0] = 0;
-                let _ = send(CAP_REP, &rep[..1]);
+                let _ = send(CAP_REP, &rep[..REPLY_HEADER]);
                 return;
             }
             _ => {
                 rep[0] = 1;
-                let _ = send(CAP_REP, &rep[..1]);
+                let _ = send(CAP_REP, &rep[..REPLY_HEADER]);
             }
         }
     }

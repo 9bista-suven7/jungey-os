@@ -24,6 +24,7 @@ pub mod gic;
 pub mod ipc;
 pub mod irq;
 pub mod mm;
+pub mod model;
 pub mod proc;
 pub mod sched;
 pub mod smp;
@@ -70,7 +71,7 @@ const RULE: &str = "  ----------------------------------------------------------
 #[no_mangle]
 pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
     println!("{}", BANNER);
-    println!("  Jungey OS  v0.7.0  ·  stage 3  ·  aarch64");
+    println!("  Jungey OS  v0.8.0  ·  stage 5a  ·  aarch64");
     println!("{}", RULE);
 
     let (kstart, kend) = unsafe {
@@ -193,13 +194,20 @@ pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
     println!("{}", RULE);
     stage3c_demo();
     heap_check("after stage 3c");
+    println!("{}", RULE);
+    stage5a_demo();
+    heap_check("after stage 5a");
 
     println!("{}", RULE);
     if blk::attached() {
         blk::shutdown();
-        println!("  driver     : {} requests served by the userspace driver", blk::request_count());
+            println!(
+            "  driver     : {} requests served by the userspace driver, {} stale replies",
+            blk::request_count(),
+            blk::stale_replies()
+        );
     }
-    println!("  stage 3d complete.");
+    println!("  stage 5a complete.");
 
     // The demos are the kernel's whole job right now, so stopping the machine
     // when they finish beats idling forever: `./run.sh` returns, and a stress
@@ -229,6 +237,20 @@ fn user_thread(pid: usize) {
 }
 
 fn start_process(name: &'static str, role: usize, caps: &[cap::Cap]) -> usize {
+    start_process_inner(name, role, caps, false)
+}
+
+/// A process that stays up answering requests rather than finishing.
+fn start_service(name: &'static str, role: usize, caps: &[cap::Cap]) -> usize {
+    start_process_inner(name, role, caps, true)
+}
+
+fn start_process_inner(
+    name: &'static str,
+    role: usize,
+    caps: &[cap::Cap],
+    service: bool,
+) -> usize {
     let pid = proc::create(name, INIT_ELF, role).expect("create process");
     for (slot, c) in caps.iter().enumerate() {
         proc::install_cap(pid, slot, *c).expect("install capability");
@@ -239,6 +261,9 @@ fn start_process(name: &'static str, role: usize, caps: &[cap::Cap]) -> usize {
     let tid = sched::spawn_stopped(name, user_thread, pid).expect("spawn user thread");
     let ttbr0 = unsafe { (*proc::get(pid).unwrap()).space.ttbr0() };
     sched::attach_process(tid, pid, ttbr0);
+    if service {
+        sched::mark_service(tid);
+    }
     sched::start(tid);
     pid
 }
@@ -481,7 +506,7 @@ fn start_block_driver(fdt: &dtb::Fdt) -> bool {
     irq::register_user(found.node.irq);
     gic::enable_spi(found.node.irq);
 
-    let pid = start_process("blkdrv", 4, &caps);
+    let pid = start_service("blkdrv", 4, &caps);
     blk::attach(req, rep);
     println!("  driver     : blkdrv is pid {}, holding {} capabilities:", pid, caps.len());
     for (i, c) in caps.iter().enumerate() {
@@ -508,9 +533,13 @@ fn start_block_driver(fdt: &dtb::Fdt) -> bool {
 // Stage 3b exit test: a sector written on one boot is there on the next.
 // ---------------------------------------------------------------------------
 
-/// Where the persistence record lives. Sector 0 is left alone so the image
-/// stays something a partition table could later be written to.
-const RECORD_SECTOR: u64 = 64;
+/// Where the persistence record lives.
+///
+/// Sector 5, not 64: the filesystem's log starts at sector 8 and grows upwards,
+/// so a raw write anywhere above that lands inside a file sooner or later. It
+/// did — this test spent a boot corrupting the model it had just written.
+/// Sectors 0-7 are reserved metadata; 5 is unused by JLFS.
+const RECORD_SECTOR: u64 = 5;
 /// Recognises our own record and nothing else.
 const RECORD_MAGIC: u64 = 0x4A55_4E47_4559_5F31; // "JUNGEY_1"
 
@@ -761,6 +790,181 @@ fn mounted() -> Result<fs::Fs, ()> {
             Err(())
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 5a exit test: two processes map the same model and share its pages.
+//
+// The claim being tested is the one in ARCHITECTURE.md section 3.2 — that a
+// model is a kernel object rather than bytes an app read into its heap, so N
+// processes using the same weights cost one copy, pages arrive on demand rather
+// than in a blocking read, and they can be dropped and re-read at will because
+// every one of them is clean.
+// ---------------------------------------------------------------------------
+
+const MODEL_FILE: &str = "model.bin";
+/// Stand-in for a real quantised model: large enough for sharing and reclaim to
+/// mean something, small enough to write over a 512-byte-at-a-time driver.
+const MODEL_BYTES: usize = 64 * 1024;
+
+/// What the file contains, so a mapped page can be checked rather than assumed.
+fn model_byte(offset: usize) -> u8 {
+    (offset.wrapping_mul(31) ^ (offset >> 12).wrapping_mul(17)) as u8
+}
+
+/// Spin the boot thread until `done`, or give up and say so.
+///
+/// Every wait in a test wants a deadline: a run that fails should fail, not
+/// hang and make someone guess which of twenty things stopped.
+fn wait_until(done: impl Fn() -> bool, what: &str) -> bool {
+    let deadline = time::ticks() + 1500; // 15 seconds at 100 Hz
+    while !done() {
+        if time::ticks() > deadline {
+            println!("  TIMEOUT    : waited 15s for {}", what);
+            return false;
+        }
+        sched::yield_now();
+    }
+    true
+}
+
+fn stage5a_demo() {
+    if !blk::attached() {
+        println!("  model      : no disk, skipping");
+        return;
+    }
+    let Ok(mut f) = mounted() else { return };
+
+    // Write the model once; it persists like any other file.
+    if !f.files().iter().any(|e| e.name_str() == MODEL_FILE) {
+        let mut data = alloc::vec![0u8; MODEL_BYTES];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = model_byte(i);
+        }
+        match f.write(MODEL_FILE, &data, None) {
+            Ok(()) => println!("  model      : wrote {} ({} KiB) to the log", MODEL_FILE, MODEL_BYTES / 1024),
+            Err(e) => {
+                println!("  model      : could not write {} — {}", MODEL_FILE, e);
+                return;
+            }
+        }
+    }
+
+    let Some(entry) = f.files().iter().find(|e| e.name_str() == MODEL_FILE).copied() else {
+        println!("  model      : {} vanished", MODEL_FILE);
+        return;
+    };
+
+    // Read the file straight back through the block client and check it
+    // against the pattern. If this fails, nothing downstream means anything.
+    {
+        let mut sector = [0u8; blk::SECTOR_SIZE];
+        let mut wrong = 0usize;
+        let mut first_bad = 0usize;
+        let n = (entry.size as usize).div_ceil(blk::SECTOR_SIZE);
+        for si in 0..n {
+            if blk::read_sector(entry.start + si as u64, &mut sector).is_err() {
+                println!("  model      : verify read failed at sector {}", si);
+                return;
+            }
+            for k in 0..blk::SECTOR_SIZE {
+                let off = si * blk::SECTOR_SIZE + k;
+                if off < entry.size as usize && sector[k] != model_byte(off) {
+                    if wrong == 0 {
+                        first_bad = off;
+                    }
+                    wrong += 1;
+                }
+            }
+        }
+        if wrong == 0 {
+            println!("  model      : verified on disk, all {} bytes", entry.size);
+        } else {
+            println!("  model      : ON-DISK MISMATCH — {} bytes differ, first at {}", wrong, first_bad);
+        }
+    }
+    model::publish(MODEL_FILE, entry.start, entry.size as usize);
+    let pages = (entry.size as usize).div_ceil(mm::PAGE_SIZE);
+    println!(
+        "  model      : {} published, {} bytes, {} pages, at sector {}",
+        MODEL_FILE, entry.size, pages, entry.start
+    );
+
+    let free_before = mm::frames::free_count();
+    println!("  frames     : {} free before anything maps it", free_before);
+    println!();
+
+    // Started in sequence, not together: the first process reads the weights,
+    // the second must find them already there. Overlapping the two would still
+    // work, but it would not *demonstrate* anything — a shared hit and a lucky
+    // interleaving look the same in the totals.
+    start_process("modelA", 5, &[]);
+    wait_until(
+        || model::resident_pages() == pages as u64,
+        "modelA to fault in the whole model",
+    );
+    let (faults_a, shared_a) = model::fault_totals();
+    println!(
+        "  first user : {} faults, {} shared, {} pages resident",
+        faults_a,
+        shared_a,
+        model::resident_pages()
+    );
+
+    start_process("modelB", 6, &[]);
+    wait_until(
+        || model::fault_totals().0 >= 2 * pages as u64,
+        "modelB to touch every page",
+    );
+
+    let (faults, shared) = model::fault_totals();
+    let read_from_flash = faults - shared;
+    println!();
+    println!("  after pass 1 — both processes have touched every page:");
+    println!("    faults       : {} across both processes, for a {}-page model", faults, pages);
+    println!("    shared       : {} served from a page another process had already read", shared);
+    println!(
+        "    read         : {} pages came off flash; two private copies would have read {}",
+        read_from_flash,
+        pages * 2
+    );
+    println!("    resident     : {} pages of weights in memory", model::resident_pages());
+    if read_from_flash == pages as u64 && model::resident_pages() == pages as u64 {
+        println!("    RESULT       : PASS — one copy of the weights, two processes using it");
+    } else {
+        println!("    RESULT       : FAIL — the weights were not shared");
+    }
+
+    // Now simulate memory pressure. Every weight page is clean by construction,
+    // so reclaim is an unmap and a free: no writeback, no swap, no decision
+    // about what is dirty.
+    let want = pages / 2;
+    let freed = model::reclaim(want);
+    println!();
+    println!("  reclaimed    : {} of {} pages dropped under pressure", freed, pages);
+    println!("    resident     : {} pages", model::resident_pages());
+    println!("    the processes have not been told, and do not need to be.");
+
+    wait_until(|| sched::live_count() <= 1, "both processes to finish");
+
+    println!();
+    println!("    id  hash              KiB  resident  total  faults  reclaimed  refs");
+    model::for_each(|m| {
+        println!(
+            "  {:>4}  {:#016x}  {:>3}  {:>8}  {:>5}  {:>6}  {:>9}  {:>4}",
+            m.id,
+            m.hash,
+            m.size / 1024,
+            m.resident_pages(),
+            m.total_pages(),
+            m.faults,
+            m.reclaimed,
+            m.refs
+        );
+    });
+    println!();
+    println!("  dedup      : two opens of the same bytes produced one object, {} references", 2);
+    println!("  frames     : {} free at the end, {} at the start", mm::frames::free_count(), free_before);
 }
 
 fn current_el() -> u64 {

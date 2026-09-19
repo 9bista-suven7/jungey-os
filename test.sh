@@ -2,7 +2,8 @@
 # Run the full test suite: every stage's exit test, end to end, from an empty
 # disk. Prints one line per check and exits non-zero if any of them fail.
 #
-#   ./test.sh            five boots: SMP, capabilities, block I/O, crash test
+#   ./test.sh            five boots: SMP, capabilities, block I/O, crash test,
+#                        userspace driver, shared model pages
 #   ./test.sh --repeat N  run the whole thing N times over, for flushing out
 #                         races that only show up occasionally
 set -uo pipefail
@@ -49,8 +50,12 @@ for round in $(seq 1 "$REPEAT"); do
     check "filesystem formatted"         1 "$LOG_DIR/boot1" "format     : superblock"
     check "driver runs in userspace"     1 "$LOG_DIR/boot1" "attached in userspace"
     check "driver holds five capabilities" 1 "$LOG_DIR/boot1" "holding 5 capabilities"
+    check "model file verified on disk"  1 "$LOG_DIR/boot1" "verified on disk"
+    check "weights shared, not copied"   1 "$LOG_DIR/boot1" "one copy of the weights"
+    check "reclaimed pages re-faulted"   2 "$LOG_DIR/boot1" "0 wrong after"
     check "no kernel panic"              0 "$LOG_DIR/boot1" "KERNEL PANIC"
-    check "boot ran to completion"       1 "$LOG_DIR/boot1" "stage 3d complete"
+    check "no wait timed out"            0 "$LOG_DIR/boot1" "TIMEOUT"
+    check "boot ran to completion"       1 "$LOG_DIR/boot1" "stage 5a complete"
 
     echo "boot 2 — verify v1, then lose power part way through the data"
     check "sector survived the reboot"   1 "$LOG_DIR/boot2" "previous   : boot 1"
@@ -74,8 +79,11 @@ for round in $(seq 1 "$REPEAT"); do
     check "v2 readable"                  1 "$LOG_DIR/boot5" "PASS — hello.txt holds v2"
     check "crash test complete"          1 "$LOG_DIR/boot5" "crash consistency test complete"
     check "driver served every request"  1 "$LOG_DIR/boot5" "requests served by the userspace driver"
+    check "weights shared on remount"    1 "$LOG_DIR/boot5" "one copy of the weights"
+    check "model survived the crashes"   1 "$LOG_DIR/boot5" "verified on disk"
     check "no kernel panic"              0 "$LOG_DIR/boot5" "KERNEL PANIC"
-    check "boot ran to completion"       1 "$LOG_DIR/boot5" "stage 3d complete"
+    check "no wait timed out"            0 "$LOG_DIR/boot5" "TIMEOUT"
+    check "boot ran to completion"       1 "$LOG_DIR/boot5" "stage 5a complete"
 done
 
 echo

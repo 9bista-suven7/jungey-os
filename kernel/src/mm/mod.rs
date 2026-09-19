@@ -41,3 +41,23 @@ pub const fn page_align_up(addr: usize) -> usize {
 pub const fn page_align_down(addr: usize) -> usize {
     addr & !(PAGE_SIZE - 1)
 }
+
+/// Try to satisfy a page fault at `va` for the running process.
+///
+/// A fault inside a demand-paged region is not an error; it is the request for
+/// a page, and answering it is the whole point of mapping a model rather than
+/// loading it. Returns whether the faulting instruction can be retried.
+pub fn demand_fault(va: usize) -> bool {
+    let Some(pid) = crate::sched::current_pid() else {
+        return false;
+    };
+    let page = page_align_down(va);
+    let Some(vma) = crate::proc::find_vma(pid, page) else {
+        return false;
+    };
+    match vma.kind {
+        crate::proc::VmaKind::Model { id } => {
+            crate::model::fault(id, page - vma.start, pid, page)
+        }
+    }
+}

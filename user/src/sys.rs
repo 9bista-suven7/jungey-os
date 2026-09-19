@@ -11,6 +11,9 @@ pub const SYS_SLEEP: usize = 7;
 pub const SYS_MAP_DEVICE: usize = 8;
 pub const SYS_DMA_MAP: usize = 9;
 pub const SYS_IRQ_WAIT: usize = 10;
+pub const SYS_MODEL_OPEN: usize = 11;
+pub const SYS_MODEL_MAP: usize = 12;
+pub const SYS_MODEL_INFO: usize = 13;
 
 #[inline(always)]
 unsafe fn syscall3(n: usize, a: usize, b: usize, c: usize) -> isize {
@@ -180,6 +183,25 @@ pub fn map_device(cap: usize, at: usize) -> isize {
 /// device understands.
 pub fn dma_map(cap: usize, at: usize) -> isize {
     unsafe { syscall3(SYS_DMA_MAP, cap, at, 0) }
+}
+
+/// Open a model by name. Returns its id, or a negative error.
+pub fn model_open(name: &str) -> isize {
+    unsafe { syscall3(SYS_MODEL_OPEN, name.as_ptr() as usize, name.len(), 0) }
+}
+
+/// Map a model into our address space. Returns its size in bytes.
+///
+/// Nothing is resident afterwards: pages arrive as we touch them, which is why
+/// a model that would take seconds to read starts in milliseconds.
+pub fn model_map(id: usize, at: usize) -> isize {
+    unsafe { syscall3(SYS_MODEL_MAP, id, at, 0) }
+}
+
+/// Fill `out` with eight u64s: id, hash, size, resident pages, total pages,
+/// faults, pages reclaimed, reference count.
+pub fn model_info(id: usize, out: &mut [u64; 8]) -> isize {
+    unsafe { syscall3(SYS_MODEL_INFO, id, out.as_mut_ptr() as usize, 0) }
 }
 
 /// Wait for our device's interrupt, up to `timeout` scheduler ticks. Returns

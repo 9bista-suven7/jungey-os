@@ -189,7 +189,12 @@ transactional intents that can be undone — now has something to be built on:
 JLFS commits by switching a root atomically, which is the same primitive an
 undoable action log needs.
 
-Sections 3.1, 3.2 and 3.5 do not exist yet — they are stage 5. What stages 0-2
+Section 3.2 — the model store — is built: content-addressed weight objects,
+demand-paged from flash, shared page-for-page between processes, and reclaimed
+first under pressure because every resident page is clean. The KV-cache tier is
+the part of 3.2 still missing.
+
+Sections 3.1 and 3.5 do not exist yet — they are stages 5b and 5d. What stages 0-2
 buy is the substrate they need: address spaces to map weight pages into, a
 scheduler to extend with QoS classes, an interrupt path that will carry
 accelerator completions, and an authority model that an inference server can be

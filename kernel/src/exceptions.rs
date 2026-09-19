@@ -86,6 +86,22 @@ pub extern "C" fn rust_exception(idx: u64, esr: u64, elr: u64, far: u64, frame: 
         return;
     }
 
+    // A translation fault from EL0 may be a demand-paged region asking for a
+    // page rather than a process misbehaving. Interrupts are unmasked because
+    // answering it can mean a disk read, which goes out to a driver process.
+    if idx == 8 {
+        let ec = esr >> 26;
+        let translation = matches!(esr & 0x3f, 0b000100..=0b000111);
+        if matches!(ec, 0b100000 | 0b100100) && translation {
+            unsafe { core::arch::asm!("msr daifclr, #3") };
+            let handled = crate::mm::demand_fault(far as usize);
+            unsafe { core::arch::asm!("msr daifset, #3") };
+            if handled {
+                return;
+            }
+        }
+    }
+
     // Anything else from EL0 kills the process rather than the kernel.
     if idx == 8 {
         let f = unsafe { &*frame };

@@ -20,6 +20,18 @@ pub const ROLE_RECEIVER: usize = 1;
 pub const ROLE_INTRUDER: usize = 2;
 pub const ROLE_TRESPASSER: usize = 3;
 pub const ROLE_BLKDRV: usize = 4;
+pub const ROLE_MODEL_A: usize = 5;
+pub const ROLE_MODEL_B: usize = 6;
+
+/// Where a mapped model goes in our address space. High enough to be clear of
+/// the image and the heap, low enough to be obviously user memory.
+const MODEL_VA: usize = 0x2000_0000;
+
+/// The pattern the kernel wrote into the model file. Checking it on every page
+/// is what turns "the mapping worked" into "the right bytes arrived".
+fn model_byte(offset: usize) -> u8 {
+    (offset.wrapping_mul(31) ^ (offset >> 12).wrapping_mul(17)) as u8
+}
 
 /// Writable process-private data. Every process maps this at the same virtual
 /// address, and each sees only its own copy — which is the whole claim of
@@ -43,6 +55,8 @@ pub extern "C" fn _start(role: usize) -> ! {
         ROLE_INTRUDER => intruder(),
         ROLE_TRESPASSER => trespasser(),
         ROLE_BLKDRV => blkdrv::run(),
+        ROLE_MODEL_A => model_user("  [modelA  ]"),
+        ROLE_MODEL_B => model_user("  [modelB  ]"),
         _ => write("user: unknown role\n"),
     }
     exit(0)
@@ -148,6 +162,97 @@ fn trespasser() {
     let kernel_va = 0xFFFF_0000_4008_0000usize as *const u64;
     let v = unsafe { core::ptr::read_volatile(kernel_va) };
     Line::new().s("  [trespass] BUG: still alive, read ").x(v as usize).nl();
+}
+
+/// Touch every page of the mapping and check what arrived.
+///
+/// The first pass faults each page in. The second runs after the kernel has
+/// reclaimed some of them, so it re-faults — and the bytes must still be right,
+/// because a weight page that is dropped and re-read is supposed to be
+/// indistinguishable from one that was never dropped.
+fn sweep(pages: usize) -> (usize, usize) {
+    let mut checked = 0;
+    let mut wrong = 0;
+    for p in 0..pages {
+        for k in 0..8 {
+            let off = p * 4096 + k * 512;
+            let got = unsafe { core::ptr::read_volatile((MODEL_VA + off) as *const u8) };
+            if got != model_byte(off) {
+                wrong += 1;
+            }
+            checked += 1;
+        }
+    }
+    (checked, wrong)
+}
+
+fn model_user(tag: &str) {
+    let id = model_open("model.bin");
+    if id < 0 {
+        say(tag, " cannot open model.bin");
+        return;
+    }
+    let size = model_map(id as usize, MODEL_VA);
+    if size < 0 {
+        say(tag, " cannot map the model");
+        return;
+    }
+    let pages = (size as usize + 4095) / 4096;
+
+    let mut info = [0u64; 8];
+    let _ = model_info(id as usize, &mut info);
+    Line::new()
+        .s(tag)
+        .s(" mapped model ")
+        .d(id as usize)
+        .s(" (")
+        .d(size as usize)
+        .s(" bytes, ")
+        .d(pages)
+        .s(" pages), resident ")
+        .d(info[3] as usize)
+        .nl();
+
+    let (checked, wrong) = sweep(pages);
+    let _ = model_info(id as usize, &mut info);
+    Line::new()
+        .s(tag)
+        .s(" pass 1: ")
+        .d(checked)
+        .s(" bytes checked, ")
+        .d(wrong)
+        .s(" wrong, ")
+        .d(info[3] as usize)
+        .s(" of ")
+        .d(info[4] as usize)
+        .s(" pages resident, ")
+        .d(info[5] as usize)
+        .s(" faults")
+        .nl();
+
+    // Wait for the kernel to reclaim under simulated pressure, then touch the
+    // same pages again. Watching the model's own counters rather than sleeping
+    // a fixed time is what makes this deterministic: the second pass starts
+    // when there is something to re-fault, not when a timer says so.
+    let mut waited = 0;
+    while info[6] == 0 && waited < 400 {
+        sleep(2);
+        waited += 2;
+        let _ = model_info(id as usize, &mut info);
+    }
+
+    let (checked2, wrong2) = sweep(pages);
+    let _ = model_info(id as usize, &mut info);
+    Line::new()
+        .s(tag)
+        .s(" pass 2: ")
+        .d(checked2)
+        .s(" bytes checked, ")
+        .d(wrong2)
+        .s(" wrong after ")
+        .d(info[6] as usize)
+        .s(" pages were reclaimed")
+        .nl();
 }
 
 fn errname(e: isize) -> &'static str {
