@@ -378,9 +378,33 @@ pub fn sleep_ticks(ticks: u64) {
     }
 }
 
-/// Leave the run queue until someone wakes `token`.
-pub fn block_on(token: u64) {
+/// Announce the intention to block, without giving up the CPU yet.
+///
+/// Blocking has to be done in two steps or wakeups get lost. A thread that
+/// checks its condition, finds nothing, and *then* marks itself blocked can be
+/// woken in between — by a sender on another core — and that wake lands on a
+/// thread that is still runnable, so it does nothing. The thread then blocks
+/// with its condition already satisfied, and waits for a second wake that is
+/// never coming.
+///
+/// The discipline is: `prepare_block`, then re-check the condition, then
+/// either `cancel_block` or `block`. A wake arriving anywhere in that window
+/// makes the thread runnable, and `block` returns immediately.
+pub fn prepare_block(token: u64) {
     with_current(|t| t.state = State::Blocked(token));
+}
+
+/// Abandon a prepared block: the condition was satisfied after all.
+pub fn cancel_block() {
+    with_current(|t| {
+        if matches!(t.state, State::Blocked(_)) {
+            t.state = State::Runnable;
+        }
+    });
+}
+
+/// Give up the CPU until the prepared block is woken.
+pub fn block(token: u64) {
     loop {
         schedule();
         let still_blocked = with_current(|t| t.state == State::Blocked(token));
@@ -388,6 +412,13 @@ pub fn block_on(token: u64) {
             return;
         }
     }
+}
+
+/// Prepare and block in one step. Only safe where the condition cannot become
+/// true between the two — which is rarer than it looks, so prefer the pair.
+pub fn block_on(token: u64) {
+    prepare_block(token);
+    block(token);
 }
 
 /// Make every thread blocked on `token` runnable again.

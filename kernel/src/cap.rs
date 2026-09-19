@@ -22,12 +22,29 @@ pub const RIGHT_RECV: u32 = 1 << 1;
 /// derivation cannot quietly become universal later.
 pub const RIGHT_GRANT: u32 = 1 << 2;
 
-pub const RIGHTS_ALL: u32 = RIGHT_SEND | RIGHT_RECV | RIGHT_GRANT;
+/// May map a device's registers, or a DMA region, into its address space.
+pub const RIGHT_MAP: u32 = 1 << 3;
+/// May wait on an interrupt.
+pub const RIGHT_IRQ: u32 = 1 << 4;
+
+pub const RIGHTS_ALL: u32 = RIGHT_SEND | RIGHT_RECV | RIGHT_GRANT | RIGHT_MAP | RIGHT_IRQ;
 
 /// What a capability points at.
+///
+/// Hardware is named the same way everything else is. A driver is an ordinary
+/// process; what makes it a driver is holding an `Mmio` capability to one
+/// device's registers, an `Irq` to that device's line, and a `Dma` region the
+/// device can reach. It cannot touch a second device, and revoking its
+/// capabilities stops it as surely as killing it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Obj {
     Channel(usize),
+    /// A device register window, by physical address.
+    Mmio { base: usize, size: usize },
+    /// A GIC interrupt.
+    Irq(u32),
+    /// Physically contiguous memory a device can be pointed at.
+    Dma { base: usize, pages: usize },
 }
 
 #[derive(Clone, Copy)]
@@ -75,19 +92,32 @@ impl Cap {
         !self.revoked && self.rights & right != 0
     }
 
-    pub fn channel(&self) -> usize {
+    pub fn channel(&self) -> Option<usize> {
         match self.obj {
-            Obj::Channel(c) => c,
+            Obj::Channel(c) => Some(c),
+            _ => None,
         }
     }
 
     /// Human-readable rights, for the audit output.
     pub fn rights_str(&self) -> &'static str {
-        match self.rights & (RIGHT_SEND | RIGHT_RECV) {
+        match self.rights & (RIGHT_SEND | RIGHT_RECV | RIGHT_MAP | RIGHT_IRQ) {
             r if r == RIGHT_SEND | RIGHT_RECV => "send+recv",
             RIGHT_SEND => "send",
             RIGHT_RECV => "recv",
+            RIGHT_MAP => "map",
+            RIGHT_IRQ => "irq",
             _ => "none",
+        }
+    }
+
+    /// What kind of thing this points at, for the audit output.
+    pub fn obj_str(&self) -> &'static str {
+        match self.obj {
+            Obj::Channel(_) => "channel",
+            Obj::Mmio { .. } => "mmio",
+            Obj::Irq(_) => "irq",
+            Obj::Dma { .. } => "dma",
         }
     }
 }

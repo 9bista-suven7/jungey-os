@@ -41,6 +41,10 @@ pub enum Perm {
     UserReadOnly,
     /// Read/write at EL0, never executable. Data, BSS, stack.
     UserData,
+    /// Device registers: read/write at EL0, never executable, and Device-nGnRnE
+    /// so the compiler and the hardware cannot reorder, merge or cache an
+    /// access to them.
+    UserDevice,
 }
 
 impl Perm {
@@ -51,6 +55,11 @@ impl Perm {
             Perm::UserText => common | PTE_AP_RO,
             Perm::UserReadOnly => common | PTE_AP_RO | PTE_UXN,
             Perm::UserData => common | PTE_UXN,
+            // Device memory takes MAIR attr0, so the normal-memory AttrIndx and
+            // the shareability bits both come off.
+            Perm::UserDevice => {
+                (common & !PTE_ATTR_NORMAL & !PTE_SH_INNER) | PTE_UXN
+            }
         }
     }
 }

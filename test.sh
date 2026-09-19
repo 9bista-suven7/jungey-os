@@ -31,9 +31,11 @@ for round in $(seq 1 "$REPEAT"); do
 
     # The crash test spans five boots and sequences itself through a marker on
     # the disk, so the disk must persist across them and start empty.
-    ./run.sh --fresh >"$LOG_DIR/boot1" 2>&1 </dev/null
+    # Every boot is bounded: a kernel that hangs should fail the suite, not
+    # wedge it. A healthy boot takes about a second.
+    timeout 60 ./run.sh --fresh >"$LOG_DIR/boot1" 2>&1 </dev/null
     for b in 2 3 4 5; do
-        ./run.sh >"$LOG_DIR/boot$b" 2>&1 </dev/null
+        timeout 60 ./run.sh >"$LOG_DIR/boot$b" 2>&1 </dev/null
     done
 
     echo "boot 1 — first light on an empty disk"
@@ -45,7 +47,10 @@ for round in $(seq 1 "$REPEAT"); do
     check "cross-core lock loses nothing" 1 "$LOG_DIR/boot1" "lock           : PASS"
     check "block write reads back"       1 "$LOG_DIR/boot1" "read back  : PASS"
     check "filesystem formatted"         1 "$LOG_DIR/boot1" "format     : superblock"
+    check "driver runs in userspace"     1 "$LOG_DIR/boot1" "attached in userspace"
+    check "driver holds five capabilities" 1 "$LOG_DIR/boot1" "holding 5 capabilities"
     check "no kernel panic"              0 "$LOG_DIR/boot1" "KERNEL PANIC"
+    check "boot ran to completion"       1 "$LOG_DIR/boot1" "stage 3d complete"
 
     echo "boot 2 — verify v1, then lose power part way through the data"
     check "sector survived the reboot"   1 "$LOG_DIR/boot2" "previous   : boot 1"
@@ -68,7 +73,9 @@ for round in $(seq 1 "$REPEAT"); do
     echo "boot 5 — the clean write survived"
     check "v2 readable"                  1 "$LOG_DIR/boot5" "PASS — hello.txt holds v2"
     check "crash test complete"          1 "$LOG_DIR/boot5" "crash consistency test complete"
+    check "driver served every request"  1 "$LOG_DIR/boot5" "requests served by the userspace driver"
     check "no kernel panic"              0 "$LOG_DIR/boot5" "KERNEL PANIC"
+    check "boot ran to completion"       1 "$LOG_DIR/boot5" "stage 3d complete"
 done
 
 echo

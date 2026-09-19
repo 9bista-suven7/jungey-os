@@ -150,7 +150,7 @@ thesis — get it wrong here and everything above inherits the mistake.*
 
 ---
 
-## Stage 3 — SMP, drivers, storage  🔶 *in progress*
+## Stage 3 — SMP, drivers, storage  ✅ *done*
 
 Broken into four parts, each with its own exit test, because the whole stage is
 too big to land or verify at once.
@@ -317,14 +317,75 @@ turns silent corruption into a refusal to mount that slot.
   workload to be tuned against rather than a guess.
 - *Whole-file writes only.* No partial updates, no append, no seek.
 
-### 3d — Userspace drivers  ⬜
+### 3d — Userspace drivers  ✅ *done*
 
-The driver framework: MMIO regions and IRQs as capabilities, so a driver is an
-ordinary process holding a `Device` capability. Move virtio-blk out of the
-kernel to prove the framework carries a real driver.
+Hardware is named the way everything else is. `Mmio`, `Irq` and `Dma` are
+capability objects, and three syscalls act on them: map a device's registers,
+map a DMA region and learn its physical address, wait for an interrupt. The
+virtio-blk driver moved out of the kernel and became an ordinary process.
 
-**Exit test:** a file written through a userspace filesystem server survives a
-hard reset, and the kernel contains no block-device code.
+**Exit test:** a file written through a userspace driver survives a hard reset,
+and the kernel contains no block-device code. ✅
+
+```
+  bus        : block device in a virtio transport at 0xa003e00, intid 79, version 2
+  driver     : blkdrv is pid 4, holding 5 capabilities:
+    slot 0     #4 channel (recv)
+    slot 1     #5 channel (send)
+    slot 2     #6 mmio (map)
+    slot 3     #7 irq (irq)
+    slot 4     #8 dma (map)
+  [blkdrv  ] attached in userspace: 131072 sectors, dma at 0x0000000040265000
+  disk       : 131072 sectors (64 MiB), driven entirely from userspace
+  ...
+  [blkdrv  ] shutting down after 15 device interrupts
+  driver     : 17 requests served by the userspace driver
+```
+
+Those five capabilities are the driver's entire authority. It has no argument it
+could pass to reach a second device: `map_device` takes *where in its own
+address space* to put the registers, never *which* registers — that comes from
+the capability. The whole of stage 3b and 3c now runs through it, including the
+power-cut crash tests.
+
+The kernel keeps exactly three virtio register offsets, in `devices.rs`, to read
+what kind of device is in each transport slot. That is bus enumeration, not a
+driver: no virtqueue, no descriptors, no block protocol, and nothing that has to
+change when the disk becomes UFS.
+
+**Three bugs, each only reachable once a driver ran on a different core from its
+client:**
+
+- *A lost wakeup in `recv`.* The receiver checked for a message, found none, and
+  then marked itself blocked. A sender on another core landing in that window
+  woke a thread that was still runnable — the wake did nothing, and the receiver
+  then blocked forever with its message already queued. Blocking is now two
+  steps: `prepare_block`, re-check, then `block` or `cancel_block`. This is
+  Linux's `prepare_to_wait` discipline, and it exists for exactly this reason.
+- *Syscalls ran with interrupts masked.* Taking an exception masks them in
+  hardware, and nothing unmasked them again. A user thread waiting inside a
+  syscall therefore stopped its core's timer: no preemption, no tick, and every
+  deadline in the system became infinite — the machine deadlocked with three
+  cores idle. Userspace had interrupts enabled and the syscall now does too,
+  re-masking before the vector restores registers.
+- *Sub-page MMIO windows cannot be isolated.* virtio-mmio spaces its transports
+  0x200 apart, so eight share a 4 KiB page and the mapping refused to align.
+  `map_device` now maps the containing page and returns the offset, which makes
+  the compromise visible rather than hiding it: a driver holding one of these
+  capabilities can reach its seven neighbours' registers. The real fixes are
+  hardware that spaces devices a page apart, an SMMU, or a trusted shim. Linux
+  and VFIO hit the same wall.
+
+**Deviations:**
+
+- *The filesystem is still in the kernel.* It is a client of the driver, not of
+  a device — `fs.rs` does not know what kind of storage is underneath or that
+  the code driving it runs outside the kernel. Moving it out is a lift-and-shift
+  of a file with no new mechanism behind it, and it is not what this stage was
+  testing.
+- *`irq_wait` polls the sequence counter* rather than sleeping on a wait queue
+  with a timer-backed timeout. It takes a mandatory timeout, so a line that
+  never asserts costs an error rather than a wedged driver.
 
 *Cost: 3–5 months for the stage. 3a took days.*
 

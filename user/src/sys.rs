@@ -8,6 +8,9 @@ pub const SYS_RECV: usize = 4;
 pub const SYS_GETPID: usize = 5;
 pub const SYS_TICKS: usize = 6;
 pub const SYS_SLEEP: usize = 7;
+pub const SYS_MAP_DEVICE: usize = 8;
+pub const SYS_DMA_MAP: usize = 9;
+pub const SYS_IRQ_WAIT: usize = 10;
 
 #[inline(always)]
 unsafe fn syscall3(n: usize, a: usize, b: usize, c: usize) -> isize {
@@ -163,4 +166,24 @@ pub fn send(cap: usize, msg: &[u8]) -> Result<usize, isize> {
 pub fn recv(cap: usize, buf: &mut [u8]) -> Result<usize, isize> {
     let r = unsafe { syscall3(SYS_RECV, cap, buf.as_mut_ptr() as usize, buf.len()) };
     if r < 0 { Err(r) } else { Ok(r as usize) }
+}
+
+/// Map the device registers `cap` names, at an address of our choosing.
+///
+/// There is no argument saying *which* device. That comes from the capability,
+/// which is the whole point: a driver cannot reach hardware it was not handed.
+pub fn map_device(cap: usize, at: usize) -> isize {
+    unsafe { syscall3(SYS_MAP_DEVICE, cap, at, 0) }
+}
+
+/// Map a DMA region and learn its physical address, which is the only form a
+/// device understands.
+pub fn dma_map(cap: usize, at: usize) -> isize {
+    unsafe { syscall3(SYS_DMA_MAP, cap, at, 0) }
+}
+
+/// Wait for our device's interrupt, up to `timeout` scheduler ticks. Returns
+/// the total number of times it has fired, or a negative error on timeout.
+pub fn irq_wait(cap: usize, timeout: usize) -> isize {
+    unsafe { syscall3(SYS_IRQ_WAIT, cap, timeout, 0) }
 }

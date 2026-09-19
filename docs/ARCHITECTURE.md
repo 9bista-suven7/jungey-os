@@ -169,12 +169,13 @@ the inference server and an app is a capability transfer, not a copy.
 
 ## 7. Current state
 
-Stages 0 through 2 are implemented, and 3a (SMP) with them: the kernel boots,
+Stages 0 through 3 are implemented: the kernel boots,
 runs in the higher half with the MMU on, allocates physical and heap memory,
 takes interrupts through a GICv3, preemptively schedules kernel threads off the
 generic timer, and runs isolated EL0 processes whose entire authority is the
 capabilities in their tables, across all four cores of the machine, and stores files on a
-log-structured filesystem that survives having its power cut mid-write.
+log-structured filesystem that survives having its power cut mid-write — over a
+disk driven by a userspace process holding five capabilities and nothing else.
 
 Section 3.3 — the capability broker — has its foundation in place. `cap.rs`
 implements minting, derivation that can only narrow rights, and subtree

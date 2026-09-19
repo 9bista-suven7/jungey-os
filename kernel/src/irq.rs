@@ -25,6 +25,47 @@ pub fn register(intid: u32, handler: fn()) {
     HANDLERS.lock().push((intid, handler));
 }
 
+/// Interrupts owned by a userspace driver, with a count of how many have
+/// arrived. The count is the message: a driver asks "has it fired since I last
+/// looked", which is the only question a level-triggered line can answer
+/// honestly after the fact.
+static USER_IRQS: SpinLock<Vec<(u32, u64)>> = SpinLock::new(Vec::new());
+
+/// Wake token for a userspace interrupt.
+pub const fn token(intid: u32) -> u64 {
+    0x1249_0000_0000 | intid as u64
+}
+
+/// Hand an interrupt to userspace. The kernel will never handle it again.
+pub fn register_user(intid: u32) {
+    let mut u = USER_IRQS.lock();
+    if !u.iter().any(|&(i, _)| i == intid) {
+        u.push((intid, 0));
+    }
+}
+
+/// How many times `intid` has fired.
+pub fn sequence(intid: u32) -> Option<u64> {
+    USER_IRQS.lock().iter().find(|&&(i, _)| i == intid).map(|&(_, n)| n)
+}
+
+/// Record an interrupt destined for userspace and mask it until the driver
+/// comes back for the next one.
+fn user_irq_fired(intid: u32) -> bool {
+    let mut u = USER_IRQS.lock();
+    let Some(slot) = u.iter_mut().find(|(i, _)| *i == intid) else {
+        return false;
+    };
+    slot.1 += 1;
+    drop(u);
+    // The kernel cannot quiet the device — only its driver can. Masking the
+    // line here is what stops a level-triggered interrupt from re-asserting
+    // immediately and starving everything else.
+    gic::disable_spi(intid);
+    sched::wake_all_on(token(intid));
+    true
+}
+
 fn handler_for(intid: u32) -> Option<fn()> {
     HANDLERS.lock().iter().find(|&&(i, _)| i == intid).map(|&(_, h)| h)
 }
@@ -52,16 +93,14 @@ pub fn dispatch() {
                 // including ELR and SPSR, is already on this thread's stack.
                 sched::tick();
             }
-            _ => match handler_for(intid) {
-                Some(h) => {
+            _ => {
+                if let Some(h) = handler_for(intid) {
                     h();
-                    gic::end_of_interrupt(intid);
-                }
-                None => {
+                } else if !user_irq_fired(intid) {
                     UNCLAIMED.fetch_add(1, Ordering::Relaxed);
-                    gic::end_of_interrupt(intid);
                 }
-            },
+                gic::end_of_interrupt(intid);
+            }
         }
     }
 }

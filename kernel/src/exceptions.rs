@@ -74,7 +74,15 @@ pub extern "C" fn rust_exception(idx: u64, esr: u64, elr: u64, far: u64, frame: 
 
     // A system call: synchronous, from a lower exception level.
     if idx == 8 && esr >> 26 == EC_SVC64 {
+        // Taking an exception masks interrupts in hardware. Userspace had them
+        // enabled, and a syscall that waits — for a message, for a device —
+        // must too, or the core it is on stops taking timer interrupts: no
+        // preemption, no tick, and every deadline in the system becomes
+        // infinite. They are masked again before returning, because the vector
+        // restores registers on the assumption that nothing interrupts it.
+        unsafe { core::arch::asm!("msr daifclr, #3") };
         crate::syscall::dispatch(unsafe { &mut *frame });
+        unsafe { core::arch::asm!("msr daifset, #3") };
         return;
     }
 

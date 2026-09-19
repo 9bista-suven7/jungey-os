@@ -22,11 +22,15 @@
 //! trace of the unfinished write — or lands after it, with the data already
 //! durable. There is no order in which a reader sees half of one.
 //!
+//! The disk is reached through `blk`, which is a client of a driver process.
+//! Nothing in this file knows what kind of device is underneath, or that the
+//! code driving it runs outside the kernel.
+//!
 //! **Assumption:** a single sector write is atomic — it lands whole or not at
 //! all. That is the same assumption every journalling filesystem makes, and the
 //! checkpoint CRC catches the case where the hardware breaks its promise.
 
-use crate::virtio::{self, SECTOR_SIZE};
+use crate::blk::{self, SECTOR_SIZE};
 
 const SB_SECTOR: u64 = 0;
 const CP_SECTORS: [u64; 2] = [1, 2];
@@ -185,20 +189,20 @@ pub fn format(total_sectors: u64) -> Result<(), &'static str> {
     put_u64(&mut sb, 20, LOG_START);
     put_u64(&mut sb, 28, total_sectors - LOG_START);
     seal(&mut sb);
-    virtio::write_sector(SB_SECTOR, &sb)?;
+    blk::write_sector(SB_SECTOR, &sb)?;
 
     // Slot B is left invalid on purpose: mount must cope with one good
     // checkpoint and one that has never been written.
     let blank = [0u8; SECTOR_SIZE];
-    virtio::write_sector(CP_SECTORS[1], &blank)?;
-    virtio::write_sector(CP_SECTORS[0], &Checkpoint::new().encode())?;
+    blk::write_sector(CP_SECTORS[1], &blank)?;
+    blk::write_sector(CP_SECTORS[0], &Checkpoint::new().encode())?;
     Ok(())
 }
 
 /// Read the superblock and adopt the newer of the two valid checkpoints.
 pub fn mount() -> Result<Fs, &'static str> {
     let mut sb = [0u8; SECTOR_SIZE];
-    virtio::read_sector(SB_SECTOR, &mut sb)?;
+    blk::read_sector(SB_SECTOR, &mut sb)?;
     if get_u64(&sb, 0) != SB_MAGIC {
         return Err("not a JLFS filesystem");
     }
@@ -210,7 +214,7 @@ pub fn mount() -> Result<Fs, &'static str> {
     let mut best: Option<(usize, Checkpoint)> = None;
     for (i, &sector) in CP_SECTORS.iter().enumerate() {
         let mut raw = [0u8; SECTOR_SIZE];
-        virtio::read_sector(sector, &mut raw)?;
+        blk::read_sector(sector, &mut raw)?;
         // A slot that fails to decode is not an error: it is either never
         // written, or the half-written casualty of a crash. That is exactly the
         // case the two-slot scheme exists to survive.
@@ -244,7 +248,7 @@ impl Fs {
         let mut sector = [0u8; SECTOR_SIZE];
         let mut done = 0;
         for s in 0..entry.sectors as u64 {
-            virtio::read_sector(entry.start + s, &mut sector)?;
+            blk::read_sector(entry.start + s, &mut sector)?;
             let n = (size - done).min(SECTOR_SIZE);
             out[done..done + n].copy_from_slice(&sector[..n]);
             done += n;
@@ -292,7 +296,7 @@ impl Fs {
             let n = (data.len() - from).min(SECTOR_SIZE);
             sector[..n].copy_from_slice(&data[from..from + n]);
             sector[n..].fill(0);
-            virtio::write_sector(start + s as u64, &sector)?;
+            blk::write_sector(start + s as u64, &sector)?;
         }
 
         if crash_after == Some(sectors) {
@@ -327,7 +331,7 @@ impl Fs {
         next.files[idx].sectors = sectors;
 
         let target = 1 - self.slot;
-        virtio::write_sector(CP_SECTORS[target], &next.encode())?;
+        blk::write_sector(CP_SECTORS[target], &next.encode())?;
         self.cp = next;
         self.slot = target;
         Ok(())
@@ -352,7 +356,7 @@ const TEST_MAGIC: u64 = 0x4A4C_4653_5445_5354; // "JLFSTEST"
 
 pub fn read_phase() -> u64 {
     let mut raw = [0u8; SECTOR_SIZE];
-    if virtio::read_sector(TEST_STATE_SECTOR, &mut raw).is_err() {
+    if blk::read_sector(TEST_STATE_SECTOR, &mut raw).is_err() {
         return 0;
     }
     if get_u64(&raw, 0) != TEST_MAGIC || !intact(&raw) {
@@ -366,5 +370,5 @@ pub fn write_phase(phase: u64) -> Result<(), &'static str> {
     put_u64(&mut raw, 0, TEST_MAGIC);
     put_u64(&mut raw, 8, phase);
     seal(&mut raw);
-    virtio::write_sector(TEST_STATE_SECTOR, &raw)
+    blk::write_sector(TEST_STATE_SECTOR, &raw)
 }

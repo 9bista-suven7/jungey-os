@@ -28,9 +28,10 @@ pub mod proc;
 pub mod sched;
 pub mod smp;
 pub mod syscall;
+pub mod blk;
+pub mod devices;
 pub mod sync;
 pub mod time;
-pub mod virtio;
 
 #[global_allocator]
 static ALLOCATOR: mm::heap::KernelAllocator = mm::heap::KernelAllocator;
@@ -69,7 +70,7 @@ const RULE: &str = "  ----------------------------------------------------------
 #[no_mangle]
 pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
     println!("{}", BANNER);
-    println!("  Jungey OS  v0.6.0  ·  stage 3  ·  aarch64");
+    println!("  Jungey OS  v0.7.0  ·  stage 3  ·  aarch64");
     println!("{}", RULE);
 
     let (kstart, kend) = unsafe {
@@ -184,14 +185,21 @@ pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
     stage3a_demo();
     heap_check("after stage 3a");
     println!("{}", RULE);
-    stage3b_demo(&fdt);
+    if start_block_driver(&fdt) {
+        println!("{}", RULE);
+        stage3b_demo();
+    }
     heap_check("after stage 3b");
     println!("{}", RULE);
     stage3c_demo();
     heap_check("after stage 3c");
 
     println!("{}", RULE);
-    println!("  stage 3c complete.");
+    if blk::attached() {
+        blk::shutdown();
+        println!("  driver     : {} requests served by the userspace driver", blk::request_count());
+    }
+    println!("  stage 3d complete.");
 
     // The demos are the kernel's whole job right now, so stopping the machine
     // when they finish beats idling forever: `./run.sh` returns, and a stress
@@ -220,10 +228,10 @@ fn user_thread(pid: usize) {
     unsafe { enter_user(entry, sp, arg) }
 }
 
-fn start_process(name: &'static str, role: usize, cap: Option<cap::Cap>) -> usize {
+fn start_process(name: &'static str, role: usize, caps: &[cap::Cap]) -> usize {
     let pid = proc::create(name, INIT_ELF, role).expect("create process");
-    if let Some(c) = cap {
-        proc::install_cap(pid, 0, c).expect("install capability");
+    for (slot, c) in caps.iter().enumerate() {
+        proc::install_cap(pid, slot, *c).expect("install capability");
     }
     // Stopped, then attached, then started: on four cores a thread that is
     // visible is a thread that is running, and one started before its address
@@ -249,10 +257,10 @@ fn stage2_demo() {
         send_cap.id, send_cap.rights_str(), recv_cap.id, recv_cap.rights_str(), root.id);
     println!();
 
-    start_process("receiver", 1, Some(recv_cap));
-    start_process("sender", 0, Some(send_cap));
-    start_process("intruder", 2, None);
-    start_process("trespasser", 3, None);
+    start_process("receiver", 1, &[recv_cap]);
+    start_process("sender", 0, &[send_cap]);
+    start_process("intruder", 2, &[]);
+    start_process("trespasser", 3, &[]);
 
     // Let the first exchange happen, then cut the root. Sleeping rather than
     // spinning means the core idles while the processes do their work.
@@ -430,6 +438,73 @@ fn heap_check(when: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// Stage 3d: hand the disk to a userspace driver, then run the stage 3b and 3c
+// tests through it. Nothing below this line knows what a virtqueue is.
+// ---------------------------------------------------------------------------
+
+/// Two DMA pages: the virtqueue, and the request header, data and status byte.
+const DMA_PAGES: usize = 2;
+
+fn start_block_driver(fdt: &dtb::Fdt) -> bool {
+    let slots = devices::virtio_slots(fdt);
+    let Some(found) = devices::find_virtio(fdt, devices::VIRTIO_BLOCK) else {
+        println!("  driver     : no block device in {} virtio transports", slots);
+        return false;
+    };
+    println!(
+        "  bus        : block device in a virtio transport at {:#x}, intid {}, version {}",
+        found.node.base, found.node.irq, found.version
+    );
+
+    let Some(dma) = mm::frames::alloc_contiguous(DMA_PAGES) else {
+        println!("  driver     : no contiguous memory for DMA");
+        return false;
+    };
+
+    // Two channels, so requests and replies cannot be confused for each other,
+    // and neither end needs a right it does not use.
+    let req = ipc::create();
+    let rep = ipc::create();
+
+    // Everything the driver is allowed to do, enumerated. It has no others.
+    let caps = [
+        cap::Cap::root(cap::Obj::Channel(req), cap::RIGHT_RECV),
+        cap::Cap::root(cap::Obj::Channel(rep), cap::RIGHT_SEND),
+        cap::Cap::root(
+            cap::Obj::Mmio { base: found.node.base as usize, size: found.node.size as usize },
+            cap::RIGHT_MAP,
+        ),
+        cap::Cap::root(cap::Obj::Irq(found.node.irq), cap::RIGHT_IRQ),
+        cap::Cap::root(cap::Obj::Dma { base: dma, pages: DMA_PAGES }, cap::RIGHT_MAP),
+    ];
+
+    irq::register_user(found.node.irq);
+    gic::enable_spi(found.node.irq);
+
+    let pid = start_process("blkdrv", 4, &caps);
+    blk::attach(req, rep);
+    println!("  driver     : blkdrv is pid {}, holding {} capabilities:", pid, caps.len());
+    for (i, c) in caps.iter().enumerate() {
+        println!("    slot {}     #{} {} ({})", i, c.id, c.obj_str(), c.rights_str());
+    }
+
+    match blk::info() {
+        Ok(capacity) => {
+            println!(
+                "  disk       : {} sectors ({} MiB), driven entirely from userspace",
+                capacity,
+                capacity * blk::SECTOR_SIZE as u64 / (1024 * 1024)
+            );
+            true
+        }
+        Err(e) => {
+            println!("  driver     : did not answer — {}", e);
+            false
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Stage 3b exit test: a sector written on one boot is there on the next.
 // ---------------------------------------------------------------------------
 
@@ -449,22 +524,13 @@ fn pattern_byte(i: usize, boot: u64) -> u8 {
     (i.wrapping_mul(31) as u64 ^ boot.wrapping_mul(131)) as u8
 }
 
-fn stage3b_demo(fdt: &dtb::Fdt) {
-    let Some((capacity, irq, queue_phys)) = virtio::init(fdt) else {
-        println!("  disk       : no virtio block device — run.sh attaches one with -drive");
+fn stage3b_demo() {
+    if !blk::attached() {
         return;
-    };
-    println!(
-        "  disk       : virtio-blk, {} sectors ({} MiB), intid {}, queue at {:#x}",
-        capacity,
-        capacity * virtio::SECTOR_SIZE as u64 / (1024 * 1024),
-        irq,
-        queue_phys
-    );
+    }
 
-    // ---- what the last boot left behind ----
-    let mut buf = [0u8; virtio::SECTOR_SIZE];
-    if let Err(e) = virtio::read_sector(RECORD_SECTOR, &mut buf) {
+    let mut buf = [0u8; blk::SECTOR_SIZE];
+    if let Err(e) = blk::read_sector(RECORD_SECTOR, &mut buf) {
         println!("  disk       : read failed — {}", e);
         return;
     }
@@ -476,12 +542,11 @@ fn stage3b_demo(fdt: &dtb::Fdt) {
         let text = core::str::from_utf8(&buf[24..24 + text_end]).unwrap_or("<invalid>");
         println!("  previous   : boot {}, written at tick {}, \"{}\"", boot, ticks, text);
 
-        // The body has to match too, or a stale-but-plausible header passes.
-        let bad = (64..virtio::SECTOR_SIZE)
+        let bad = (64..blk::SECTOR_SIZE)
             .filter(|&i| buf[i] != pattern_byte(i, boot))
             .count();
         if bad == 0 {
-            println!("  previous   : body verified, all {} pattern bytes match", virtio::SECTOR_SIZE - 64);
+            println!("  previous   : body verified, all {} pattern bytes match", blk::SECTOR_SIZE - 64);
         } else {
             println!("  previous   : BODY CORRUPT — {} bytes differ", bad);
         }
@@ -491,40 +556,34 @@ fn stage3b_demo(fdt: &dtb::Fdt) {
         None
     };
 
-    // ---- write this boot's record ----
     let boot = previous.map_or(1, |b| b + 1);
-    let mut out = [0u8; virtio::SECTOR_SIZE];
+    let mut out = [0u8; blk::SECTOR_SIZE];
     out[0..8].copy_from_slice(&RECORD_MAGIC.to_le_bytes());
     out[8..16].copy_from_slice(&boot.to_le_bytes());
     out[16..24].copy_from_slice(&time::ticks().to_le_bytes());
     let text = b"written by jungey os";
     out[24..24 + text.len()].copy_from_slice(text);
-    for i in 64..virtio::SECTOR_SIZE {
+    for i in 64..blk::SECTOR_SIZE {
         out[i] = pattern_byte(i, boot);
     }
 
-    if let Err(e) = virtio::write_sector(RECORD_SECTOR, &out) {
+    if let Err(e) = blk::write_sector(RECORD_SECTOR, &out) {
         println!("  disk       : write failed — {}", e);
         return;
     }
     println!("  wrote      : boot {} to sector {}", boot, RECORD_SECTOR);
 
-    // ---- read it straight back ----
-    let mut check = [0u8; virtio::SECTOR_SIZE];
-    if let Err(e) = virtio::read_sector(RECORD_SECTOR, &mut check) {
+    let mut check = [0u8; blk::SECTOR_SIZE];
+    if let Err(e) = blk::read_sector(RECORD_SECTOR, &mut check) {
         println!("  disk       : read-back failed — {}", e);
         return;
     }
-    let differing = (0..virtio::SECTOR_SIZE).filter(|&i| check[i] != out[i]).count();
+    let differing = (0..blk::SECTOR_SIZE).filter(|&i| check[i] != out[i]).count();
     if differing == 0 {
-        println!("  read back  : PASS — all {} bytes identical", virtio::SECTOR_SIZE);
+        println!("  read back  : PASS — all {} bytes identical", blk::SECTOR_SIZE);
     } else {
         println!("  read back  : FAIL — {} bytes differ", differing);
     }
-
-    println!("  completion : {} interrupts from the device", virtio::irq_count());
-    println!();
-    println!("  boot again and 'previous' should read boot {}.", boot);
 }
 
 // ---------------------------------------------------------------------------
@@ -577,7 +636,7 @@ const V1_LEN: usize = 1100; // three sectors, so a partial write is possible
 const V2_LEN: usize = 1600;
 
 fn stage3c_demo() {
-    if !virtio::have_disk() {
+    if !blk::attached() {
         println!("  fs         : no disk, skipping");
         return;
     }
@@ -588,7 +647,7 @@ fn stage3c_demo() {
     match phase {
         0 => {
             // Fresh disk: lay down a filesystem and one committed file.
-            if let Err(e) = fs::format(virtio::capacity_sectors()) {
+            if let Err(e) = fs::format(blk::capacity_sectors()) {
                 println!("  fs         : format failed — {}", e);
                 return;
             }
@@ -633,7 +692,7 @@ fn stage3c_demo() {
             // this reason.
             let _ = fs::write_phase(phase + 1);
             let v2 = contents(2, V2_LEN);
-            let full = v2.len().div_ceil(virtio::SECTOR_SIZE) as u32;
+            let full = v2.len().div_ceil(blk::SECTOR_SIZE) as u32;
             // First a crash part way through the data, then one with every byte
             // written and only the commit missing.
             let point = if phase == 1 { 1 } else { full };

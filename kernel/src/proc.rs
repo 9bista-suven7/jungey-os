@@ -31,6 +31,9 @@ pub struct Process {
     /// Handed to the process in x0 at entry. The only argument it ever gets.
     pub arg: usize,
     pub exit_code: Option<isize>,
+    /// Interrupts this process has already been told about. One counter,
+    /// because a process holds one `Irq` capability at this stage.
+    pub irq_seen: u64,
 }
 
 /// Processes are leaked for the lifetime of the kernel; reaping arrives with
@@ -62,6 +65,7 @@ pub fn create(name: &'static str, image: &[u8], arg: usize) -> Result<usize, &'s
         stack_top: USER_STACK_TOP,
         arg,
         exit_code: None,
+        irq_seen: 0,
     })));
     Ok(pid)
 }
@@ -111,9 +115,10 @@ pub fn revoke(cap_id: u64) -> usize {
                     if !c.revoked && crate::cap::is_descendant(c.id, cap_id) {
                         c.revoked = true;
                         killed += 1;
-                        let Obj::Channel(ch) = c.obj;
-                        if !affected_channels.contains(&ch) {
-                            affected_channels.push(ch);
+                        if let Obj::Channel(ch) = c.obj {
+                            if !affected_channels.contains(&ch) {
+                                affected_channels.push(ch);
+                            }
                         }
                     }
                 }

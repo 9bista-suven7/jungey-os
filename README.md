@@ -12,6 +12,12 @@ Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and
 
 ## Status
 
+**Stage 3 complete — the disk is driven from outside the kernel.** `Mmio`, `Irq`
+and `Dma` are capability objects, so a driver is an ordinary process: the
+virtio-blk driver holds five capabilities and has no way to reach anything else.
+The kernel keeps three register offsets for bus enumeration and contains no
+virtqueue, descriptor or block-protocol code at all.
+
 **Stage 3c — it has a filesystem that survives power loss.** JLFS: an
 append-only log with two checkpoint slots, where committing is a single sector
 write. Pull the plug part way through a write and the next mount sees the old
@@ -118,6 +124,16 @@ first; see `docs/ROADMAP.md` for those):
   read back  : PASS — all 512 bytes identical
   completion : 3 interrupts from the device
   ----------------------------------------------------------
+  bus        : block device in a virtio transport at 0xa003e00, intid 79, version 2
+  driver     : blkdrv is pid 4, holding 5 capabilities:
+    slot 0     #4 channel (recv)
+    slot 1     #5 channel (send)
+    slot 2     #6 mmio (map)
+    slot 3     #7 irq (irq)
+    slot 4     #8 dma (map)
+  [blkdrv  ] attached in userspace: 131072 sectors, dma at 0x0000000040265000
+  disk       : 131072 sectors (64 MiB), driven entirely from userspace
+  ----------------------------------------------------------
   fs         : crash-consistency test, phase 3
   mounted    : checkpoint seq 2 from slot 1
   verify     : PASS — hello.txt holds v1, all 1100 bytes match
@@ -125,7 +141,9 @@ first; see `docs/ROADMAP.md` for those):
   log        : 3 sectors used, 0 garbage — both crashes cost no space
   write      : hello.txt v2 committed, checkpoint seq 3
   ----------------------------------------------------------
-  stage 3c complete.
+  [blkdrv  ] shutting down after 15 device interrupts
+  driver     : 17 requests served by the userspace driver
+  stage 3d complete.
   powering off via psci.
 ```
 
@@ -172,6 +190,18 @@ Read that output as a set of claims, each of which fails loudly if broken:
   never advanced because the checkpoint never landed, so the next write reuses
   them.
 
+**Userspace drivers (stage 3d)**
+
+- **A driver is an ordinary process.** Five capabilities are its entire
+  authority: two channels, the device's registers, the device's interrupt, and
+  memory the device can reach.
+- **It cannot reach a second device.** `map_device` takes *where in its own
+  address space* to put the registers, never *which* registers.
+- **The kernel has no driver in it.** Three virtio identity-register offsets in
+  `devices.rs` say what kind of device is in each slot. That is bus
+  enumeration; there is no virtqueue or block-protocol code anywhere in
+  `kernel/`.
+
 The kernel powers off through PSCI when it finishes, so `./run.sh` returns
 rather than idling forever.
 
@@ -212,7 +242,8 @@ os/
 ├── user/                     userspace, built and embedded by the kernel build
 │   ├── linker.ld             loaded at 4 MiB, segments grouped by permission
 │   └── src/
-│       ├── main.rs           the four test roles
+│       ├── main.rs           the test roles
+│       ├── blkdrv.rs         the virtio-blk driver — an ordinary process
 │       └── sys.rs            syscall stubs — the whole kernel interface
 └── kernel/
     ├── linker.ld             image layout; linked high, loaded at 0x4008_0000
@@ -228,7 +259,8 @@ os/
         ├── gic.rs            GICv3 distributor, redistributor, CPU interface
         ├── time.rs           generic timer, per-core 100 Hz tick
         ├── smp.rs            PSCI bring-up, per-CPU state on TPIDR_EL1
-        ├── virtio.rs         virtio-mmio transport and virtio-blk driver
+        ├── devices.rs        bus enumeration — what is in each slot
+        ├── blk.rs            block storage, as a client of a driver process
         ├── fs.rs             JLFS: append-only log, two checkpoint slots
         ├── dtb.rs            flattened device tree reader
         ├── cap.rs            capabilities: minting, derivation, revocation
@@ -303,3 +335,9 @@ the higher half.
   to a Rust type must not be able to change what is on someone's disk.
 - **A test that has to survive a broken filesystem cannot live inside it.** The
   crash test's phase marker sits in its own sector, outside JLFS entirely.
+- **Blocking is two steps.** `prepare_block`, re-check the condition, then
+  `block` or `cancel_block`. Checking first and blocking second loses any wakeup
+  that lands in between, and the thread waits forever for a second one.
+- **Syscalls run with interrupts enabled.** Exception entry masks them in
+  hardware; a syscall that waits with them masked stops its core's timer, and
+  every deadline in the system becomes infinite.

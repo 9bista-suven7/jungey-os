@@ -10,6 +10,7 @@
 #![no_std]
 #![no_main]
 
+mod blkdrv;
 mod sys;
 
 use sys::*;
@@ -18,6 +19,7 @@ pub const ROLE_SENDER: usize = 0;
 pub const ROLE_RECEIVER: usize = 1;
 pub const ROLE_INTRUDER: usize = 2;
 pub const ROLE_TRESPASSER: usize = 3;
+pub const ROLE_BLKDRV: usize = 4;
 
 /// Writable process-private data. Every process maps this at the same virtual
 /// address, and each sees only its own copy — which is the whole claim of
@@ -40,6 +42,7 @@ pub extern "C" fn _start(role: usize) -> ! {
         ROLE_RECEIVER => receiver(),
         ROLE_INTRUDER => intruder(),
         ROLE_TRESPASSER => trespasser(),
+        ROLE_BLKDRV => blkdrv::run(),
         _ => write("user: unknown role\n"),
     }
     exit(0)
@@ -63,8 +66,8 @@ fn show_marker(tag: &str) {
         .nl();
 }
 
-/// One line, one syscall: `tag`, then `text`, then an error name.
-fn say(tag: &str, text: &str) {
+/// One line, one syscall: `tag`, then `text`.
+pub fn say(tag: &str, text: &str) {
     Line::new().s(tag).s(text).nl();
 }
 

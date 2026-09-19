@@ -199,6 +199,21 @@ pub fn enable_spi(intid: u32) {
     }
 }
 
+/// Stop delivering a shared peripheral interrupt.
+///
+/// Used when an interrupt belongs to a userspace driver: the kernel cannot
+/// quiet the device, only the driver can, so the line is masked at the GIC on
+/// arrival and unmasked when the driver comes back for the next one. Without
+/// that, a level-triggered line would re-assert immediately and the core would
+/// do nothing but take the same interrupt forever.
+pub fn disable_spi(intid: u32) {
+    let gicd = GICD.load(Ordering::Relaxed);
+    unsafe {
+        wr(gicd, GICD_ICENABLER + (intid as usize / 32) * 4, 1 << (intid & 31));
+        gicd_wait_rwp(gicd);
+    }
+}
+
 /// Take the highest-priority pending interrupt. `SPURIOUS` if there is none.
 #[inline]
 pub fn acknowledge() -> u32 {
