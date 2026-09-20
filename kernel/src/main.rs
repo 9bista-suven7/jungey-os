@@ -79,7 +79,7 @@ const RULE: &str = "  ----------------------------------------------------------
 #[no_mangle]
 pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
     println!("{}", BANNER);
-    println!("  Jungey OS  v0.13.0  ·  stages 0-6  ·  aarch64");
+    println!("  Jungey OS  v0.14.0  ·  stages 0-7  ·  aarch64");
     println!("{}", RULE);
 
     let (kstart, kend) = unsafe {
@@ -173,6 +173,7 @@ pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
     println!("  sched      : round-robin, thread 0 is '{}'", sched::current_name());
 
     time::start();
+    sched::enable_reschedule_ipi();
     println!("  timer      : cntv at {} Hz, tick {} Hz, intid {}", time::frequency(), time::HZ, time::TIMER_INTID);
 
     unsafe { core::arch::asm!("msr daifclr, #3") }; // interrupts live from here
@@ -186,6 +187,9 @@ pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
         }
     }
     println!("  smp        : {} of {} cores online", smp::online_count(), ncpus);
+    // Every core has its reschedule interrupt enabled now, so it is safe — and
+    // useful — to start sending them.
+    sched::ipi_ready();
     println!("{}", RULE);
 
     // Nothing runs at EL0 until the image it would run has been measured. The
@@ -236,6 +240,9 @@ pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
     println!("{}", RULE);
     stage7c_demo();
     heap_check("after stage 7c");
+    println!("{}", RULE);
+    stage7a_demo();
+    heap_check("after stage 7a");
 
     // A screen, if the machine has one. `sim.sh` attaches a display; `run.sh`
     // does not, and everything above works identically either way.
@@ -259,7 +266,7 @@ pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
             blk::stale_replies()
         );
     }
-    println!("  stage 6 complete.");
+    println!("  boot sequence complete.");
 
     // The demos are the kernel's whole job right now, so stopping the machine
     // when they finish beats idling forever: `./run.sh` returns, and a stress
@@ -2406,6 +2413,118 @@ fn stage7c_demo() {
         println!("  update     : this boot confirmed the slot it was trying");
     } else {
         println!("  update     : sequence in progress");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 7a exit test: an idle machine stops asking.
+//
+// A phone spends almost all of its life doing nothing, and what it costs to do
+// nothing is most of what its battery life is. A kernel with a periodic tick
+// wakes every core a hundred times a second to be told, a hundred times a
+// second, that there is still nothing to do. Each of those is a full exit from
+// the core's low-power state.
+//
+// The fix has two halves, and the first is the one that is easy to get wrong:
+//
+//   - **The clock must not be the interrupt.** If time is the number of times
+//     a core was interrupted, a core that stops being interrupted stops time,
+//     and every sleep in the system is wrong. Here `time::ticks()` is computed
+//     from the architected counter, so the interrupt carries no information
+//     the clock needs and can be skipped freely.
+//   - **Something else must be able to wake a sleeping core.** A core that has
+//     programmed its timer for a second needs to hear about work that arrives
+//     in the meantime. That is an interrupt the kernel sends itself, broadcast
+//     to every core but the sender, whenever a thread becomes runnable.
+//
+// The measurement is the same machine twice: idle with the periodic tick, then
+// idle without it, counting timer interrupts across all four cores. Doing it
+// in one boot rather than two builds is deliberate — two numbers from two
+// binaries are not a comparison.
+
+/// How long each idle window is. Long enough that the fixed cost of getting
+/// into it does not dominate, short enough that the boot stays brisk.
+const IDLE_WINDOW_TICKS: u64 = 60;
+
+/// Sit still for a while and report what it cost.
+fn idle_window(label: &str) -> (u64, u64) {
+    let irqs_before = time::timer_irqs();
+    let start = time::ticks();
+    sched::sleep_ticks(IDLE_WINDOW_TICKS);
+    let elapsed = time::ticks().saturating_sub(start);
+    let irqs = time::timer_irqs() - irqs_before;
+    println!(
+        "    {:<10} {:>4} ticks idle, {:>5} timer interrupts across {} cores",
+        label,
+        elapsed,
+        irqs,
+        smp::online_count()
+    );
+    (elapsed, irqs)
+}
+
+fn stage7a_demo() {
+    println!("  power      : what it costs this machine to do nothing");
+    println!(
+        "    clock      {} MHz counter, {} Hz scheduling quantum",
+        time::frequency() / 1_000_000,
+        time::HZ
+    );
+
+    // Nothing else must be running, or the comparison measures that instead.
+    // Services are excluded: a driver waiting on its channel is blocked, not
+    // busy, and blocked threads are exactly what an idle machine is made of.
+    println!("    live work  {} thread(s) still running", sched::live_count());
+    println!();
+
+    time::set_tickless(false);
+    let (t1, periodic) = idle_window("periodic");
+
+    time::set_tickless(true);
+    let (t2, tickless) = idle_window("tickless");
+    time::set_tickless(false);
+
+    // The clock has to have kept time through both, or the saving is bought
+    // with a broken machine. `sleep_ticks` asks for a number of ticks and the
+    // window is measured independently, from the counter.
+    let kept_time = t1 >= IDLE_WINDOW_TICKS && t2 >= IDLE_WINDOW_TICKS && t2 < IDLE_WINDOW_TICKS * 2;
+
+    // And a sleeper must still wake when it said, not when the machine next
+    // happens to look.
+    let asked = 7u64;
+    let before = time::ticks();
+    time::set_tickless(true);
+    sched::sleep_ticks(asked);
+    time::set_tickless(false);
+    let slept = time::ticks().saturating_sub(before);
+    let punctual = slept >= asked && slept <= asked + 2;
+
+    println!();
+    let saved = periodic.saturating_sub(tickless);
+    let pct = if periodic > 0 { saved * 100 / periodic } else { 0 };
+    println!(
+        "  saving     : {} interrupts became {} — {}% fewer wakeups for the same {} ticks",
+        periodic, tickless, pct, IDLE_WINDOW_TICKS
+    );
+    println!(
+        "  punctual   : a thread asking for {} ticks slept {} — the clock is the counter, not the tick",
+        asked, slept
+    );
+    println!(
+        "  wakeups    : {} times a core has come out of WFI since boot",
+        sched::idle_wakeups()
+    );
+
+    println!();
+    if pct >= 50 && kept_time && punctual {
+        println!("  RESULT     : PASS — an idle machine takes {}% fewer timer interrupts, time", pct);
+        println!("               still runs while nothing is interrupting it, and a sleeping");
+        println!("               thread still wakes when it asked to");
+    } else {
+        println!(
+            "  RESULT     : FAIL — {}% fewer, kept time {}, punctual {} (slept {} of {})",
+            pct, kept_time, punctual, slept, asked
+        );
     }
 }
 

@@ -264,6 +264,7 @@ pub extern "C" fn secondary_main(descriptor: *const u8) -> ! {
     // Become this core's idle thread, then start taking work.
     crate::sched::adopt_as_idle(id);
     crate::time::start();
+    crate::sched::enable_reschedule_ipi();
     unsafe { core::arch::asm!("msr daifclr, #3") };
 
     crate::sched::idle_loop()

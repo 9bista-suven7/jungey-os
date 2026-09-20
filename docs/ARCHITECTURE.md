@@ -135,6 +135,14 @@ input to the tensor scheduler rather than a governor reacting after the fact:
 jobs declare a budget, the scheduler admits what fits in the remaining thermal
 headroom, and `opportunistic` work is the elastic band that absorbs the rest.
 
+The other half of the same problem is what the machine costs when it is doing
+nothing at all, which on a phone is most of its life. A periodic scheduling
+tick is a hundred wakeups a second spent confirming there is nothing to do, so
+the clock is read from the counter rather than counted from interrupts, and an
+idle core sleeps until something is actually due. What that exposes is more
+interesting than what it saves: any service that polls becomes the entire idle
+cost of the system the moment the tick stops hiding it.
+
 ## 4. Kernel object model (target)
 
 | Object | Purpose |
@@ -242,11 +250,41 @@ is a real compromise and it is there because a frame is 1.8 MB and there is no
 way yet for two processes to share a buffer; the split waits on shared memory
 objects.
 
+**The software half of stage 7 is built too.** Three things, and each one is
+the software answer to a question the hardware would otherwise have to answer:
+
+*Idle costs what you let it cost.* `time::ticks()` is computed from the
+architected counter rather than counted from interrupts, which is what makes it
+possible to stop interrupting: under the old arrangement a core that stopped
+being interrupted stopped time. A software-generated interrupt broadcast to the
+other cores carries the news that work has arrived, so a core sleeping on a
+distant deadline still hears about it. An idle machine takes 96% fewer timer
+interrupts, measured in one boot with the behaviour switched at runtime — and
+the first measurement saved nothing at all, because a polling loop in the
+tensor worker had been hiding behind the tick for three stages.
+
+*Nothing runs before it is measured.* The kernel hashes the userspace image
+against a digest recorded when the two were built together, and powers the
+machine off rather than run something else. The measurement is appended to the
+action log, so what ran and what it did are in one record stream. This is
+measured boot, not verified boot: the expected digest lives inside the kernel
+image, so it is only as trustworthy as the kernel. A signature and a key the
+hardware protects is a contained change to one file and an impossible one
+without a boot ROM.
+
+*An update can be taken back.* Two system slots and a control block in their
+own region of the disk; install into the slot that is not running, switch with
+one sector write, spend the try counter before the attempt rather than after,
+and let only the running system mark itself good. The exit test runs it across
+real power cycles: an update that never comes up is rolled back with nobody
+watching, and the one after it is kept.
+
 **What is not here:** the hardware half of stage 4 (a display server against
 real DRM/KMS-equivalent hardware, GPU bring-up, text layout, a shell worth
-using) and all of stage 7 (power management, suspend/resume, verified boot, OTA
-with A/B slots, modem, and the long tail of thermals and reliability on real
-silicon). Neither is a few commits away; both are the years `ROADMAP.md` says
+using) and the hardware half of stage 7 (suspend-to-RAM and multi-day standby,
+CPU hotplug and DVFS, a modem, a real root of trust, user data that survives a
+rollback, and the long tail of thermals and reliability on silicon that is not
+emulated). Neither is a few commits away; both are the years `ROADMAP.md` says
 they are. Everything above runs under QEMU on emulated hardware, which is the
 right place to prove a scheduling and authority model and the wrong place to
 claim a device.

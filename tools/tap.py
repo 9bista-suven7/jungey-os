@@ -102,5 +102,5 @@ for x, y, expectation in TAPS:
 
 # Let the OS finish its own report, then let it power itself off.
 wait_for("RESULT     : PASS — every tap reached", 30) or wait_for("RESULT     :", 5)
-wait_for("stage 6 complete", 30)
+wait_for("boot sequence complete", 30)
 cmd("quit")

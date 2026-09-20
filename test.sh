@@ -78,6 +78,9 @@ for round in $(seq 1 "$REPEAT"); do
     check "image measured before it runs" 1 "$LOG_DIR/boot1" "bytes  sha256 .*matches the build"
     check "flipped byte is refused"      1 "$LOG_DIR/boot1" "rejected — it is not the image"
     check "measured boot result"         1 "$LOG_DIR/boot1" "RESULT     : PASS — the userspace image is measured"
+    check "idle machine stops asking"    1 "$LOG_DIR/boot1" "fewer wakeups for the same"
+    check "the clock survived the quiet" 1 "$LOG_DIR/boot1" "the clock is the counter, not the tick"
+    check "power result"                 1 "$LOG_DIR/boot1" "RESULT     : PASS — an idle machine takes"
     check "kv survived the flash trip"   1 "$LOG_DIR/boot1" "every byte survived the round trip"
     check "kv policy correct"            1 "$LOG_DIR/boot1" "RESULT     : PASS — the budget held"
     check "model file verified on disk"  1 "$LOG_DIR/boot1" "verified on disk"
@@ -85,7 +88,7 @@ for round in $(seq 1 "$REPEAT"); do
     check "reclaimed pages re-faulted"   2 "$LOG_DIR/boot1" "0 wrong after"
     check "no kernel panic"              0 "$LOG_DIR/boot1" "KERNEL PANIC"
     check "no wait timed out"            0 "$LOG_DIR/boot1" "TIMEOUT"
-    check "boot ran to completion"       1 "$LOG_DIR/boot1" "stage 6 complete"
+    check "boot ran to completion"       1 "$LOG_DIR/boot1" "boot sequence complete"
 
     echo "boot 2 — verify v1, then lose power part way through the data"
     check "sector survived the reboot"   1 "$LOG_DIR/boot2" "previous   : boot 1"
@@ -114,7 +117,7 @@ for round in $(seq 1 "$REPEAT"); do
     check "no kernel panic"              0 "$LOG_DIR/boot5" "KERNEL PANIC"
     check "no wait timed out"            0 "$LOG_DIR/boot5" "TIMEOUT"
     check "scheduler still correct"      1 "$LOG_DIR/boot5" "RESULT     : PASS — interactive work preempted"
-    check "boot ran to completion"       1 "$LOG_DIR/boot5" "stage 6 complete"
+    check "boot ran to completion"       1 "$LOG_DIR/boot5" "boot sequence complete"
 
     echo "boot 6 — a screen, a pointer, and two applications"
     # A separate boot, on its own disk: it needs a display and an input device,
@@ -134,7 +137,7 @@ for round in $(seq 1 "$REPEAT"); do
     check "only the damage is redrawn"     1 "$LOG_DIR/ui" "smallest transfer"
     check "ui result"                      1 "$LOG_DIR/ui" "RESULT     : PASS — every tap reached exactly one window"
     check "no kernel panic"                0 "$LOG_DIR/ui" "KERNEL PANIC"
-    check "boot ran to completion"         1 "$LOG_DIR/ui" "stage 6 complete"
+    check "boot ran to completion"         1 "$LOG_DIR/ui" "boot sequence complete"
 
     echo "boot 7 — a kernel that expects a different image"
     # Built with the wrong digest recorded, so the refusal can be watched end

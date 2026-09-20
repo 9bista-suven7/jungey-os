@@ -190,6 +190,21 @@ pub fn enable_ppi(intid: u32) {
     }
 }
 
+/// Wake every other core.
+///
+/// A software-generated interrupt with the routing mode bit set goes to all
+/// PEs except this one. It is what makes tickless idle correct rather than
+/// merely cheap: a core that has programmed its timer for half a second needs
+/// something other than that timer to tell it work has arrived, and this is
+/// it.
+pub fn send_sgi_all_but_self(intid: u32) {
+    // ICC_SGI1R_EL1: INTID at [27:24], IRM ("all but self") at bit 40.
+    let v = ((intid as u64 & 0xf) << 24) | (1 << 40);
+    unsafe {
+        core::arch::asm!("msr S3_0_C12_C11_5, {}", "isb", in(reg) v);
+    }
+}
+
 /// Enable a shared peripheral interrupt (SPI, 32 and up).
 pub fn enable_spi(intid: u32) {
     let gicd = GICD.load(Ordering::Relaxed);

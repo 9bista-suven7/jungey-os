@@ -869,13 +869,217 @@ really ends.*
 
 ---
 
-## Stage 7 — A device you carry
+## Stage 7 — A device you carry  ◐ *7a–7c done, the device is not*
 
 Power management that reaches multi-day standby, suspend/resume, secure and
 verified boot with your own keys, OTA updates with A/B slots and rollback,
 modem integration, and the long unglamorous tail of thermals and reliability.
 
 **Exit test:** it is your only phone for two weeks.
+
+Three pieces of this are software problems and are built. The rest are
+hardware problems wearing software clothes, and they are the reason the stage
+costs what it costs.
+
+### 7a — An idle machine stops asking  ✅ *done*
+
+A phone spends nearly all its life doing nothing, and what it costs to do
+nothing is most of what its battery life is. A kernel with a periodic tick
+wakes every core a hundred times a second to be told, a hundred times a second,
+that there is still nothing to do.
+
+**Exit test:** an idle machine takes far fewer timer interrupts, time still
+runs while nothing is interrupting it, and a sleeping thread still wakes when
+it asked to. ✅
+
+```
+  power      : what it costs this machine to do nothing
+    clock      62 MHz counter, 100 Hz scheduling quantum
+    live work  1 thread(s) still running
+
+    periodic     60 ticks idle,   235 timer interrupts across 4 cores
+    tickless     60 ticks idle,     8 timer interrupts across 4 cores
+
+  saving     : 235 interrupts became 8 — 96% fewer wakeups for the same 60 ticks
+  punctual   : a thread asking for 7 ticks slept 7 — the clock is the counter, not the tick
+  RESULT     : PASS — an idle machine takes 96% fewer timer interrupts, time
+               still runs while nothing is interrupting it, and a sleeping
+               thread still wakes when it asked to
+```
+
+Both numbers come from the same boot of the same binary, with the behaviour
+switched at runtime. Two numbers from two builds are not a comparison.
+
+**Two things had to be true first, and the first is the one that is easy to get
+wrong.**
+
+*The clock must not be the interrupt.* `time::ticks()` used to be a counter
+incremented by core 0's timer IRQ. Under that arrangement a core that stops
+being interrupted stops time, and every sleep in the system becomes wrong —
+so tickless idle is not a change you can make to it at all. The fix is to
+compute the tick from the architected counter, which makes the interrupt a
+pure *wakeup*: it carries no information the clock needs, so it can be skipped
+freely.
+
+*Something other than the timer must be able to wake a core.* A core that has
+programmed its timer half a second out still has to hear about work that
+arrives in the meantime. That is a software-generated interrupt broadcast to
+every core but the sender, sent whenever a thread becomes runnable. It is sent
+whether or not tickless idle is on, so the path that matters is one that has
+been running all along rather than one that comes to life only when the power
+saving is switched on.
+
+**And then the measurement found the actual cost, which was not the tick.**
+The first run saved nothing at all: 235 interrupts became 237. The tensor
+scheduler's worker thread had a `sleep_ticks(1)` polling loop, so the earliest
+sleeper was always one tick away and the "long" sleep was never long. That
+loop had been invisible for three stages — one more wakeup among a hundred —
+and became the entire idle cost the moment the tick went away. It now blocks
+on the device and is woken by a submission, using the same lock-held
+`prepare_block` discipline as the IPC path. This is the usual shape of the
+problem: power is not spent by the thing you are measuring, it is spent by
+whatever was hiding behind it.
+
+**Deviations:**
+
+- *No suspend-to-RAM.* Multi-day standby needs the whole device to stop —
+  drivers saving and restoring state, a wakeup source list, PSCI
+  `SYSTEM_SUSPEND` — and QEMU's `virt` machine does not model any of the power
+  states that would make it measurable. What is here is idle, not standby.
+- *No CPU hotplug.* Cores idle in WFI rather than being taken offline with
+  PSCI `CPU_OFF`. Offlining is worth real power on a real part and nothing
+  under emulation, and it would trade a tested scheduler for an untested one.
+- *No DVFS, no per-device power domains, no wakeup-source accounting* — all of
+  which need a real SoC's clock tree and regulators to mean anything.
+- *The idle backstop is one second.* Correctness does not depend on it, since a
+  runnable thread sends an interrupt; it is there so a lost wakeup shows up as
+  a stutter rather than a hang.
+
+### 7b — Measure what you are about to run  ✅ *done*
+
+**Exit test:** the image is measured before anything runs, the measurement is
+compared with what the build recorded, and a single altered byte is refused. ✅
+
+```
+  boot chain :
+    kernel     497064 bytes  sha256 6bdf0c353f511c41…9fe70f07
+    init       339656 bytes  sha256 e5ac8398f48f63f1…84baa4dd  matches the build
+
+  tamper     : byte 169828 of the init image flipped
+    measured   sha256 fd1e011e2eb7d506a1672ca899adbd82f956c0a5ac3d1aee01cc90ff453ddd83
+    verdict    : rejected — it is not the image this kernel was built with
+  audit      : boot measurement recorded as record #3
+```
+
+And with the expectation itself corrupted, `./run.sh --tamper`:
+
+```
+    init       339656 bytes  sha256 e5ac8398f48f63f1…84baa4dd
+    expected   at build time sha256 e5ac8398f48f63f1…84baa4d0
+    MISMATCH   — the image is not the one this kernel was built with
+  boot       : refusing to start userspace.
+```
+
+SHA-256 is written out in `kernel/src/sha256.rs` and `include!`d by `build.rs`,
+so the digest recorded at build time and the digest checked at boot come from
+the same code. A measured boot whose two sides implement the hash separately is
+one that can disagree with itself for reasons that have nothing to do with the
+image. The measurement is appended to stage 6's action log, so what ran and
+what it then did are in the same record stream.
+
+***This is measured boot, not verified boot, and the difference is the whole
+point of the stage.*** A measurement says "this is the image that was here when
+the kernel was built". A *signature* says "somebody holding a key I trust
+vouched for this", which is what lets an image be replaced by its author later.
+The expected digest here lives inside the kernel image, so an attacker who can
+replace the kernel replaces the digest with it and the check is worth nothing.
+Closing that needs a root of trust the kernel cannot reach and cannot be talked
+out of: a boot ROM that checks the kernel against a fused public key, and a key
+store that will not hand out the private half. QEMU's `virt` machine has
+neither, and swapping the comparison for a signature check is a contained
+change to one file once there is hardware to hold the key.
+
+### 7c — An update you can take back  ✅ *done*
+
+An update that can brick the device is not an update, it is a gamble.
+
+**Exit test:** a version that never comes up is rolled back with nobody
+watching, the previous system returns, and the next update is kept — across
+real power cycles. ✅
+
+```
+--- power cycle 1 ---
+  update     : no control block — this device has never been updated
+    slot A holds version 1 and is what is running
+    staged     version 2 into slot B (it will not come up), 2 tries
+--- power cycle 4 ---
+  update     : booted slot B version 2 on probation, 1 try left after this one
+    measured   the slot before running it: digest matches the control block
+    self-test  FAILED — not confirming; this try is spent either way
+--- power cycle 5 ---
+  update     : booted slot B version 2 on probation, 0 tries left after this one
+    self-test  FAILED — not confirming; this try is spent either way
+--- power cycle 6 ---
+  update     : slot B ran out of tries — rolled back to slot A, version 1
+    nobody was there to do it: the counter reached zero and the rule ran
+    staged     version 3 into slot B, 2 tries
+--- power cycle 7 ---
+  update     : booted slot B version 3 on probation, 1 try left after this one
+    self-test  passed — marked successful, probation over
+    slot A   version 1  empty
+    slot B   version 3  successful    <- active
+  RESULT     : PASS — a version that never came up was rolled back after two
+               tries with nobody watching, the previous system returned, and
+               the next update was kept
+```
+
+**Four rules, and the order of them is the mechanism:**
+
+1. An update is written to the slot that is *not* running, so an interrupted
+   install costs a slot rather than a device.
+2. Switching to it is a single sector write, so the switch either happened or
+   did not. There is no state where half the pointer moved — the same
+   atomicity assumption JLFS already makes for its checkpoint, for the same
+   reason: a device guarantees a sector, not a range.
+3. **The try counter is spent before the attempt, not after.** This is the rule
+   that separates a rollback from a bootloop: a system that decrements
+   afterwards never decrements at all when the failure is a hang.
+4. Only the running system can mark itself good, and only once it has come up
+   far enough to mean it.
+
+A slot is measured against the digest in the control block before it is used,
+so 7b's check applies to the thing an update put there as well as to the thing
+the build did.
+
+`tools/otatest.sh` runs the sequence until the verdict rather than for a fixed
+number of boots, because the filesystem's own crash test cuts the power on two
+early ones before the update code is reached — which is itself a fair model of
+an update attempt interrupted by a power failure.
+
+**Deviations:**
+
+- ***The slots do not hold a kernel.*** There is no bootloader here to hand
+  control to a chosen slot, so the "system image" is a payload this kernel
+  writes, verifies and health-checks. The state machine, the durability
+  ordering, the digest check and the rollback are real and are what the test
+  exercises; making the slots hold the kernel means a bootloader that reads
+  this control block — U-Boot with a boot script, or a small first stage of our
+  own — which is a separate piece of work rather than a bigger version of this
+  one.
+- *Two tries, where real systems use three to seven.* Nothing about the
+  mechanism changes with the number; two keeps the exit test to a handful of
+  power cycles.
+- *No delta updates, no signature on the payload, no partition for user data
+  that survives a rollback.* The last one matters most in practice and is not
+  addressed here at all.
+
+### What is left of stage 7
+
+Suspend-to-RAM and multi-day standby, CPU hotplug and DVFS, a modem (which is
+a certification problem as much as a software one), a real root of trust, user
+data that survives a rollback, and the long unglamorous tail of thermals and
+reliability on silicon that is not emulated. None of it is a few commits away,
+and none of it can be honestly claimed from inside QEMU.
 
 *Cost: 12+ months, and this is the stage that kills projects that survived
 everything else.*
@@ -884,16 +1088,21 @@ everything else.*
 
 ## Reality check
 
-**Where this actually stands.** Stages 0, 1, 2, 3 (a–d), 4a, 5 (a–d) and 6 are
-built, and each one's exit test runs — `./test.sh` is sixty-odd assertions
-across six boots, and it fails rather than hangs. The rest of stage 4 and all of
-stage 7 are not, and neither is a matter of another few commits: stage 4 needs a
-real GPU and a real panel, and stage 7 needs a real phone, a modem, a key store
-and the patience to carry one as a daily driver. Both are listed here as years
-because they are years. The honest summary is that the *software* story —
-inference as a scheduled resource, authority you can trace, actions you can
-undo, a tap that goes to exactly one window — is real and tested under QEMU, and
-the *device* story has not started.
+**Where this actually stands.** Stages 0, 1, 2, 3 (a–d), 4a, 5 (a–d), 6 and
+7 (a–c) are built, and each one's exit test runs — `./test.sh` is eighty-odd
+assertions across a dozen boots, and it fails rather than hangs.
+
+What is left of stages 4 and 7 is what needs hardware: a GPU and a panel, a
+modem, a boot ROM with a fused key, real power states, and the patience to
+carry the result as a daily phone. Those are listed here as years because they
+are years, and no amount of work inside QEMU converts into them.
+
+The honest summary is that the *software* story is real and tested — inference
+as a scheduled resource, authority you can trace, actions you can undo, a tap
+that reaches exactly one window, an idle machine that stops asking, an image
+that is measured before it runs, and an update that takes itself back. The
+*device* story has not started, and the gap between the two is the whole of
+what makes a phone.
 
 Stages 0–3 are a genuinely achievable solo project and teach more than any
 course. Stage 5 is where the idea becomes *worth something* — and it is reachable

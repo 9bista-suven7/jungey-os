@@ -342,6 +342,12 @@ pub fn submit_with_budget(
         device_us: 0,
         refusal: "",
     });
+    drop(dev);
+
+    // The worker is asleep until there is something to run. Waking it here,
+    // after the lock is released, is what lets it stop polling — and polling
+    // once a tick forever is what an idle phone cannot afford.
+    sched::wake_all_on(DEVICE_TOKEN);
     Ok(id)
 }
 
@@ -423,7 +429,20 @@ fn run_segment() -> u64 {
     time::now_us().saturating_sub(start)
 }
 
+/// What the worker blocks on when there is no work.
+///
+/// Any value that nothing else uses; channels block on their own index, so
+/// this is deliberately far from those.
+const DEVICE_TOKEN: u64 = 0xDEC0_DE00_7E45_0201;
+
 /// The device worker. One thread, one accelerator.
+///
+/// It sleeps on `DEVICE_TOKEN` rather than waking once a tick to ask whether
+/// anything has arrived. That polling loop was invisible while the kernel had
+/// a periodic tick — one more wakeup among a hundred — and became the entire
+/// idle cost the moment the tick went away. It is the usual shape of the
+/// problem: power is not spent by the thing you are measuring, it is spent by
+/// whatever was hiding behind it.
 pub fn worker(_: usize) {
     loop {
         let chosen = {
@@ -431,6 +450,12 @@ pub fn worker(_: usize) {
             match pick(&dev) {
                 None => {
                     dev.last_run = None;
+                    // Marked blocked while still holding the device lock, so a
+                    // submit either lands before this and is seen, or finds
+                    // this thread already waiting and wakes it. The same
+                    // structural fix as `ipc::recv_or_prepare`, for the same
+                    // reason: checking and then blocking has a window in it.
+                    sched::prepare_block(DEVICE_TOKEN);
                     None
                 }
                 Some(i) => {
@@ -457,7 +482,7 @@ pub fn worker(_: usize) {
         };
 
         let Some(id) = chosen else {
-            sched::sleep_ticks(1);
+            sched::block(DEVICE_TOKEN);
             continue;
         };
 

@@ -220,14 +220,17 @@ pub fn mark_service(tid: usize) {
 
 /// Release a thread created by `spawn_stopped` into the run queue.
 pub fn start(tid: usize) {
-    let s = SCHED.lock();
-    if let Some(&t) = s.threads.get(tid) {
-        unsafe {
-            if (*t).state == State::New {
-                (*t).state = State::Runnable;
+    {
+        let s = SCHED.lock();
+        if let Some(&t) = s.threads.get(tid) {
+            unsafe {
+                if (*t).state == State::New {
+                    (*t).state = State::Runnable;
+                }
             }
         }
     }
+    kick_others();
 }
 
 fn spawn_pinned(
@@ -361,21 +364,88 @@ pub extern "C" fn finish_switch() {
     unsafe { (*(prev as *mut Thread)).on_cpu = None };
 }
 
-/// Called from each core's timer IRQ. Every tick is a preemption point.
-pub fn tick() {
+/// The interrupt this kernel sends itself to say "look again".
+///
+/// Tickless idle only works if something other than the timer can wake a core
+/// that has programmed its timer for half a second away. This is that
+/// something: SGI 0, broadcast to every core but the sender, whose handler
+/// does nothing except go round the scheduler.
+pub const RESCHEDULE_SGI: u32 = 0;
+
+/// Enable the reschedule interrupt on this core. Every core calls it, because
+/// an SGI is enabled per core in its own redistributor.
+pub fn enable_reschedule_ipi() {
+    crate::gic::enable_ppi(RESCHEDULE_SGI);
+}
+
+/// Set once every core has enabled the reschedule interrupt. Sending one
+/// before then is harmless but pointless, and the flag keeps early boot from
+/// depending on hardware that is not set up yet.
+static IPI_READY: AtomicBool = AtomicBool::new(false);
+
+pub fn ipi_ready() {
+    IPI_READY.store(true, Ordering::Release);
+}
+
+/// Tell the other cores there is something to run.
+///
+/// Called whenever a thread becomes runnable. With a periodic tick this is
+/// redundant — a core would notice within 10 ms anyway — and with tickless
+/// idle it is the whole mechanism. It is sent either way, so the path that
+/// matters is the one that has been running all along rather than one that
+/// comes to life only when the power saving is switched on.
+fn kick_others() {
+    if IPI_READY.load(Ordering::Acquire) {
+        crate::gic::send_sgi_all_but_self(RESCHEDULE_SGI);
+    }
+}
+
+/// Handler for the reschedule interrupt.
+pub fn reschedule_ipi() {
+    let (work, next) = wake_sleepers_and_survey();
+    crate::time::arm_next(work, next);
+    schedule();
+}
+
+/// Wake anything whose deadline has passed, and report what the core should
+/// do next: whether there is runnable work, and when the earliest remaining
+/// sleeper is due.
+///
+/// Both answers come from one pass under one lock, because they have to agree:
+/// arming a long sleep on the strength of a survey taken before the wakeup
+/// sweep is how a tickless kernel oversleeps.
+fn wake_sleepers_and_survey() -> (bool, Option<u64>) {
     let now = crate::time::ticks();
-    {
-        let s = SCHED.lock();
-        for &t in s.threads.iter() {
-            unsafe {
-                if let State::Sleeping(until) = (*t).state {
-                    if now >= until {
-                        (*t).state = State::Runnable;
-                    }
+    let mut work = false;
+    let mut earliest: Option<u64> = None;
+    let s = SCHED.lock();
+    for &t in s.threads.iter() {
+        unsafe {
+            match (*t).state {
+                State::Sleeping(until) if now >= until => {
+                    (*t).state = State::Runnable;
+                    work = true;
                 }
+                State::Sleeping(until) => {
+                    earliest = Some(earliest.map_or(until, |e: u64| e.min(until)));
+                }
+                // An idle thread is the one pinned to a core; it being
+                // runnable is not work, it is the absence of work.
+                State::Runnable if (*t).affinity.is_none() => work = true,
+                _ => {}
             }
         }
     }
+    (work, earliest)
+}
+
+/// Called from each core's timer IRQ. Every tick is a preemption point.
+pub fn tick() {
+    let (work, next) = wake_sleepers_and_survey();
+    // Decide when to be interrupted again *after* looking at what there is to
+    // do, not before. Rearming first is how a tickless kernel quietly goes on
+    // waking every 10 ms.
+    crate::time::arm_next(work, next);
     schedule();
 }
 
@@ -438,13 +508,20 @@ pub fn block_on(token: u64) {
 
 /// Make every thread blocked on `token` runnable again.
 pub fn wake_all_on(token: u64) {
-    let s = SCHED.lock();
-    for &t in s.threads.iter() {
-        unsafe {
-            if (*t).state == State::Blocked(token) {
-                (*t).state = State::Runnable;
+    let mut woke = false;
+    {
+        let s = SCHED.lock();
+        for &t in s.threads.iter() {
+            unsafe {
+                if (*t).state == State::Blocked(token) {
+                    (*t).state = State::Runnable;
+                    woke = true;
+                }
             }
         }
+    }
+    if woke {
+        kick_others();
     }
 }
 

@@ -12,6 +12,14 @@ Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and
 
 ## Status
 
+**Stage 7a–c — it idles, it checks itself, and it can take an update back.**
+An idle machine takes 96% fewer timer interrupts than it used to, and time
+still runs while nothing is interrupting it. The userspace image is measured
+before anything runs and a single altered byte is refused. An update that never
+comes up is rolled back after two tries with nobody watching, across real power
+cycles. What is measured boot rather than verified boot, and what the update
+slots do not contain, is spelled out below.
+
 **Stage 4a — you can tap it.** A third userspace driver reads an absolute
 pointer, the display server composites windows over the background and
 transfers only the damaged rectangle, and two applications hold two
@@ -117,7 +125,7 @@ its demos finish, so `./run.sh` normally returns on its own in about a second.
 To run every stage's exit test end to end:
 
 ```bash
-./test.sh              # six boots from an empty disk
+./test.sh              # a dozen boots from an empty disk
 ./test.sh --repeat 5   # the whole thing five times over, to shake out races
 ```
 
@@ -127,6 +135,8 @@ To run it as a device with a screen:
 ./sim.sh               # boots with a display, saves frames to screenshots/
 ./sim.sh --gui         # opens a window instead, if you have a desktop — tap it
 ./tools/uitest.sh      # boots, taps four places over QMP, checks where they went
+./tools/otatest.sh     # power-cycles it until an update is rolled back and replaced
+./run.sh --tamper      # a kernel that expects a different image, and refuses
 ```
 
 QEMU is the simulator in both cases — it emulates the cores, the GIC, the
@@ -247,7 +257,12 @@ first; see `docs/ROADMAP.md` for those):
   tamper     : record #0 altered on disk
     verification: chain breaks at #0
   ----------------------------------------------------------
-  stage 6 complete.
+  power      : what it costs this machine to do nothing
+    periodic     60 ticks idle,   235 timer interrupts across 4 cores
+    tickless     60 ticks idle,     8 timer interrupts across 4 cores
+  saving     : 235 interrupts became 8 — 96% fewer wakeups for the same 60 ticks
+  ----------------------------------------------------------
+  boot sequence complete.
   powering off via psci.
 ```
 
@@ -374,6 +389,33 @@ The compositor lives inside the display driver's process. Splitting it out is
 the right design and it is not done: without shared buffers it would cost 1.8 MB
 of copying per frame, and the README would rather say that than pretend.
 
+**Power, boot integrity and updates (stage 7a–c)**
+
+- **An idle machine stops asking.** 235 timer interrupts across four cores over
+  sixty idle ticks became 8 — the same boot, the same binary, the behaviour
+  switched at runtime, because two numbers from two builds are not a
+  comparison.
+- **Time is the counter, not the tick.** A thread asking for seven ticks still
+  sleeps seven. If the clock were the interrupt, a core that stopped being
+  interrupted would stop time and every sleep in the system would be wrong.
+- **The measurement found the real cost.** The first run saved nothing: a
+  `sleep_ticks(1)` poll in the tensor worker, invisible for three stages, was
+  the entire idle cost once the tick went away. It blocks on the device now.
+- **Nothing runs until it has been measured.** The kernel hashes the userspace
+  image and powers the machine off rather than run something else.
+  `./run.sh --tamper` builds a kernel that expects a different image so the
+  refusal can be watched rather than asserted.
+- **An update that never comes up is taken back.** Two slots, a try counter
+  spent *before* the attempt rather than after, and a rollback that happens
+  because the counter reached zero, not because anyone was watching.
+
+This is measured boot, not verified boot: the expected digest lives inside the
+kernel image, so an attacker who can replace the kernel replaces the digest
+with it. A real root of trust is a boot ROM with a fused key, which QEMU does
+not have. And the update slots do not hold a kernel — there is no bootloader
+here to hand control to one — so what is tested is the state machine, the
+durability ordering and the rollback, not the flashing of a system.
+
 The kernel powers off through PSCI when it finishes, so `./run.sh` returns
 rather than idling forever.
 
@@ -411,7 +453,8 @@ os/
 ├── test.sh                   every stage's exit test, end to end
 ├── tools/
 │   ├── uitest.sh             boot with a pointer and tap it over QMP
-│   └── tap.py                the taps, and what each one should reach
+│   ├── tap.py                the taps, and what each one should reach
+│   └── otatest.sh            power-cycle it through an update and a rollback
 ├── docs/
 │   ├── ARCHITECTURE.md       the design and why it is shaped this way
 │   └── ROADMAP.md            stages 0-7, exit tests, honest costs
@@ -448,6 +491,9 @@ os/
         ├── tensor.rs         the tensor scheduler: QoS, deadlines, preemption
         ├── audit.rs          hash-chained action log, one record per action
         ├── intent.rs         typed operations, transactional intents, undo
+        ├── sha256.rs         SHA-256; build.rs includes this same file
+        ├── measure.rs        measured boot: hash the image, refuse a mismatch
+        ├── ota.rs            A/B slots, a try counter, and a rollback rule
         ├── display.rs        builds frames; knows nothing about pixels
         ├── dtb.rs            flattened device tree reader
         ├── cap.rs            capabilities: minting, derivation, revocation

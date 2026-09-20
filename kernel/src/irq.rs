@@ -87,11 +87,17 @@ pub fn dispatch() {
 
         match intid {
             time::TIMER_INTID => {
-                time::rearm();
+                time::took_interrupt();
                 gic::end_of_interrupt(intid);
                 // Preemption point. Safe here because the full register state,
                 // including ELR and SPSR, is already on this thread's stack.
                 sched::tick();
+            }
+            // Another core said there is something to run. Nothing to do but
+            // go and look.
+            sched::RESCHEDULE_SGI => {
+                gic::end_of_interrupt(intid);
+                sched::reschedule_ipi();
             }
             _ => {
                 if let Some(h) = handler_for(intid) {
