@@ -19,6 +19,7 @@ SECTIONS
     . = PHYS_OFFSET + PHYS_BASE;
     __kernel_start = .;
 
+    __text_start = .;
     .text : {
         KEEP(*(.text.boot))
         *(.text .text.*)
@@ -26,6 +27,9 @@ SECTIONS
 
     . = ALIGN(4096);
     .rodata : { *(.rodata .rodata.*) }
+    /* Code and constants: the part of the image that should never change
+     * between one boot and the next, and therefore the part worth measuring. */
+    __rodata_end = .;
 
     . = ALIGN(4096);
     .data : { *(.data .data.*) }

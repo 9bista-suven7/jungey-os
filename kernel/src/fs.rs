@@ -48,6 +48,15 @@ const SPILL_SECTORS: u64 = 16 * 1024; // 8 MiB
 /// records what an agent did is worthless if the thing it is auditing can grow
 /// over it.
 const AUDIT_SECTORS: u64 = 2048; // 1 MiB
+
+/// Sectors reserved for the A/B update slots, below the audit log: one
+/// control sector and two system-image slots.
+///
+/// The update mechanism owns these outright. An update that could be
+/// overwritten by ordinary file writes is an update that can disappear
+/// between staging it and rebooting into it.
+pub const OTA_SLOT_SECTORS: u64 = 64; // 32 KiB per slot
+const OTA_SECTORS: u64 = 1 + 2 * OTA_SLOT_SECTORS;
 const CP_SECTORS: [u64; 2] = [1, 2];
 pub const TEST_STATE_SECTOR: u64 = 4;
 const LOG_START: u64 = 8;
@@ -99,13 +108,16 @@ fn crc32(data: &[u8]) -> u32 {
 }
 
 /// Stamp a sector's trailing CRC over everything before it.
-fn seal(sector: &mut [u8; SECTOR_SIZE]) {
+/// Stamp a sector's trailing checksum. Public because the update region's
+/// control block is sealed the same way: one sector, written atomically, with
+/// a checksum that says whether the write landed whole.
+pub fn seal(sector: &mut [u8; SECTOR_SIZE]) {
     let c = crc32(&sector[..CRC_OFF]);
     put_u32(sector, CRC_OFF, c);
 }
 
 /// Does a sector's CRC match its contents?
-fn intact(sector: &[u8; SECTOR_SIZE]) -> bool {
+pub fn intact(sector: &[u8; SECTOR_SIZE]) -> bool {
     crc32(&sector[..CRC_OFF]) == get_u32(sector, CRC_OFF)
 }
 
@@ -194,6 +206,10 @@ pub struct Fs {
     pub spill_sectors: u64,
     pub audit_start: u64,
     pub audit_sectors: u64,
+    /// First sector of the update region: the boot control block, then the
+    /// two system-image slots.
+    pub ota_start: u64,
+    pub ota_sectors: u64,
     /// Which checkpoint slot the live root is in. The next commit writes the
     /// other one, so a torn write can never damage the root we booted from.
     pub slot: usize,
@@ -208,12 +224,15 @@ pub fn format(total_sectors: u64) -> Result<(), &'static str> {
     put_u64(&mut sb, 12, total_sectors);
     let spill_start = total_sectors - SPILL_SECTORS;
     let audit_start = spill_start - AUDIT_SECTORS;
+    let ota_start = audit_start - OTA_SECTORS;
     put_u64(&mut sb, 20, LOG_START);
-    put_u64(&mut sb, 28, audit_start - LOG_START);
+    put_u64(&mut sb, 28, ota_start - LOG_START);
     put_u64(&mut sb, 36, spill_start);
     put_u64(&mut sb, 44, SPILL_SECTORS);
     put_u64(&mut sb, 52, audit_start);
     put_u64(&mut sb, 60, AUDIT_SECTORS);
+    put_u64(&mut sb, 68, ota_start);
+    put_u64(&mut sb, 76, OTA_SECTORS);
     seal(&mut sb);
     blk::write_sector(SB_SECTOR, &sb)?;
 
@@ -227,6 +246,11 @@ pub fn format(total_sectors: u64) -> Result<(), &'static str> {
     // so clearing the first sector is enough — and leaving stale records from a
     // previous filesystem would have the new one's log start mid-chain.
     blk::write_sector(audit_start, &blank)?;
+
+    // And the boot control block: a fresh filesystem has no update history,
+    // and a stale one from a previous filesystem would point the next boot at
+    // a slot holding somebody else's bytes.
+    blk::write_sector(ota_start, &blank)?;
     Ok(())
 }
 
@@ -245,6 +269,8 @@ pub fn mount() -> Result<Fs, &'static str> {
     let spill_sectors = get_u64(&sb, 44);
     let audit_start = get_u64(&sb, 52);
     let audit_sectors = get_u64(&sb, 60);
+    let ota_start = get_u64(&sb, 68);
+    let ota_sectors = get_u64(&sb, 76);
 
     let mut best: Option<(usize, Checkpoint)> = None;
     for (i, &sector) in CP_SECTORS.iter().enumerate() {
@@ -261,10 +287,33 @@ pub fn mount() -> Result<Fs, &'static str> {
     }
 
     let (slot, cp) = best.ok_or("no valid checkpoint: filesystem is unrecoverable")?;
-    Ok(Fs { cp, slot, total_sectors, spill_start, spill_sectors, audit_start, audit_sectors })
+    Ok(Fs {
+        cp,
+        slot,
+        total_sectors,
+        spill_start,
+        spill_sectors,
+        audit_start,
+        audit_sectors,
+        ota_start,
+        ota_sectors,
+    })
 }
 
 impl Fs {
+    /// The first sector the log may not touch: whichever reserved region sits
+    /// lowest. Asking the superblock rather than naming one of them means
+    /// adding a third region cannot silently let the log grow over the second.
+    pub fn log_limit(&self) -> u64 {
+        let mut limit = self.total_sectors;
+        for r in [self.ota_start, self.audit_start, self.spill_start] {
+            if r != 0 && r < limit {
+                limit = r;
+            }
+        }
+        limit
+    }
+
     pub fn files(&self) -> &[FileEntry] {
         &self.cp.files[..self.cp.count]
     }
@@ -314,7 +363,7 @@ impl Fs {
         let start = self.cp.log_head;
         // The log stops at the reserved regions rather than at the end of the
         // disk: other subsystems own those sectors.
-        if start + sectors as u64 > self.audit_start {
+        if start + sectors as u64 > self.log_limit() {
             return Err("log is full");
         }
 

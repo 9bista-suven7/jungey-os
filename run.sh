@@ -6,6 +6,7 @@
 #   ./run.sh --gdb      halt and wait for a debugger on :1234
 #   ./run.sh --fault    end the demo with a deliberate null dereference
 #   ./run.sh --fresh    start from an empty disk image
+#   ./run.sh --tamper   record the wrong image digest, to watch the boot refuse
 set -euo pipefail
 
 # Fail with something useful if the toolchain is missing, rather than letting
@@ -29,7 +30,8 @@ for arg in "$@"; do
         --gdb)   QEMU_EXTRA+=(-s -S) ;;
         --fault) FEATURES+=(--features fault-demo) ;;
         --fresh) FRESH=1 ;;
-        -h|--help) sed -n '2,8p' "$0"; exit 0 ;;
+        --tamper) export JUNGEY_TAMPER=1 ;;
+        -h|--help) sed -n '2,9p' "$0"; exit 0 ;;
         *) echo "unknown option: $arg" >&2; exit 2 ;;
     esac
 done

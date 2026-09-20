@@ -33,6 +33,9 @@ pub mod smp;
 pub mod syscall;
 pub mod tensor;
 pub mod audit;
+pub mod measure;
+pub mod ota;
+pub mod sha256;
 pub mod blk;
 pub mod devices;
 pub mod display;
@@ -185,6 +188,15 @@ pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
     println!("  smp        : {} of {} cores online", smp::online_count(), ncpus);
     println!("{}", RULE);
 
+    // Nothing runs at EL0 until the image it would run has been measured. The
+    // refusal is the point: a check that only reports is not a gate.
+    if !verify_boot() {
+        println!("  boot       : refusing to start userspace.");
+        println!("  powering off via psci.");
+        smp::system_off()
+    }
+    println!("{}", RULE);
+
     stage2_demo();
     heap_check("after stage 2");
     println!("{}", RULE);
@@ -218,6 +230,12 @@ pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
     println!("{}", RULE);
     stage6_demo();
     heap_check("after stage 6");
+    println!("{}", RULE);
+    stage7b_demo();
+    heap_check("after stage 7b");
+    println!("{}", RULE);
+    stage7c_demo();
+    heap_check("after stage 7c");
 
     // A screen, if the machine has one. `sim.sh` attaches a display; `run.sh`
     // does not, and everything above works identically either way.
@@ -248,6 +266,35 @@ pub extern "C" fn kernel_main(dtb_phys: usize) -> ! {
     // loop is bounded by the work rather than by a timeout.
     println!("  powering off via psci.");
     smp::system_off()
+}
+
+/// Measure the kernel and the userspace image, and refuse to go on if the
+/// image is not the one this kernel was built with.
+fn verify_boot() -> bool {
+    let m = measure::measure(INIT_ELF);
+    println!("  boot chain :");
+    println!(
+        "    kernel     {} bytes  sha256 {}",
+        measure::kernel_image().len(),
+        measure::short(&m.kernel)
+    );
+    match m.expected {
+        Some(e) if m.ok => println!(
+            "    init       {} bytes  sha256 {}  matches the build",
+            INIT_ELF.len(),
+            measure::short(&e)
+        ),
+        Some(e) => {
+            println!("    init       {} bytes  sha256 {}", INIT_ELF.len(), measure::short(&m.init));
+            println!("    expected   {:<14}sha256 {}", "at build time", measure::short(&e));
+            println!("    MISMATCH   — the image is not the one this kernel was built with");
+        }
+        None => println!("    init       no usable digest was recorded at build time"),
+    }
+    // The kernel measures itself but does not judge itself: the expected value
+    // would have to live inside the bytes it covers. That check belongs to a
+    // boot ROM, and this machine has none.
+    m.ok
 }
 
 // ---------------------------------------------------------------------------
@@ -2144,6 +2191,221 @@ fn stage6_demo() {
             "  RESULT     : FAIL — work {}, chain depth {}, log {}, restored {}, reversed {}, tamper {}, repaired {}",
             did_work, depth, chain_ok, restored, reversed, detected, repaired
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 7b exit test: the image is measured before it runs, and a single
+// altered byte is refused.
+//
+// The gate itself is upstream of this — `verify_boot`, before any process
+// exists. What is left to show here is that the check can actually say no,
+// and that the measurement is recorded where it can be read afterwards. A
+// check nobody has watched reject anything is a claim.
+
+fn stage7b_demo() {
+    let m = measure::measure(INIT_ELF);
+    println!("  measured   : the image this boot is running");
+    println!("    init       sha256 {}", measure::full(&m.init));
+    match m.expected {
+        Some(e) => println!("    recorded   sha256 {}", measure::full(&e)),
+        None => println!("    recorded   nothing usable"),
+    }
+
+    // One byte, in the middle of the image, hashed without copying it: the
+    // prefix, the altered byte, and the suffix.
+    let at = INIT_ELF.len() / 2;
+    let altered = measure::measure_with_flipped_byte(INIT_ELF, at);
+    println!("  tamper     : byte {} of the init image flipped", at);
+    println!("    measured   sha256 {}", measure::full(&altered));
+    let rejected = m.expected != Some(altered);
+    println!(
+        "    verdict    : {}",
+        if rejected { "rejected — it is not the image this kernel was built with" } else { "ACCEPTED — FAIL" }
+    );
+
+    // Tie it to stage 6's log: what ran, and what it was, in the same record
+    // stream as what it then did.
+    let recorded = if audit::ready() {
+        let h = measure::full(&m.init);
+        match audit::append("kernel", 0, "boot.measure", &h[..32]) {
+            Ok(seq) => {
+                println!("  audit      : boot measurement recorded as record #{}", seq);
+                true
+            }
+            Err(_) => false,
+        }
+    } else {
+        false
+    };
+
+    println!();
+    if m.ok && rejected {
+        println!("  RESULT     : PASS — the userspace image is measured before anything runs,");
+        println!("               the measurement matches the build, a single altered byte is");
+        if recorded {
+            println!("               refused, and what ran is in the action log alongside what");
+            println!("               it did");
+        } else {
+            println!("               refused");
+        }
+    } else {
+        println!("  RESULT     : FAIL — matched {}, rejected a flipped byte {}", m.ok, rejected);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 7c exit test: an update that never comes up is rolled back, and the
+// one after it is kept.
+//
+// The sequence spans six real power cycles, because that is the only way to
+// test it: every interesting property of an A/B scheme is about what survives
+// the machine stopping. `./tools/otatest.sh` runs them in order and checks
+// each one.
+//
+//   1  fresh device: slot A holds version 1, and a faulty version 2 is staged
+//      into slot B, which becomes active with two tries
+//   2  boot B, try 1 of 2 — it does not come up, so it does not confirm
+//   3  boot B, try 2 of 2 — likewise
+//   4  out of tries: roll back to A, and stage a good version 3 into B
+//   5  boot B, try 1 of 2 — it comes up and says so
+//   6  boot B, already successful: nothing to prove
+//
+// The claims:
+//
+//   - an update is written to the slot that is not running, so an interrupted
+//     install cannot damage a working system;
+//   - the try counter is spent before the attempt, so a boot that hangs still
+//     costs a try;
+//   - a slot is measured before it is used, so a corrupted slot is refused
+//     rather than run;
+//   - a slot that never confirms is abandoned and the previous system comes
+//     back, without anybody being there to do it.
+
+fn slot_table(c: &ota::Control) {
+    for slot in 0..2 {
+        let line = alloc::format!(
+            "    slot {}   version {}  {:<12}{}",
+            ota::slot_name(slot),
+            c.version[slot],
+            c.state[slot].label(),
+            if slot == c.active { "  <- active" } else { "" }
+        );
+        println!("{}", line.trim_end());
+    }
+}
+
+fn stage7c_demo() {
+    if !blk::attached() {
+        println!("  update     : no disk, skipping");
+        return;
+    }
+    let Ok(f) = mounted() else { return };
+
+    let (mut c, outcome) = ota::boot(&f);
+    let mut confirmed = false;
+
+    match outcome {
+        ota::Outcome::Fresh => {
+            println!("  update     : no control block — this device has never been updated");
+            match ota::initialise(&f) {
+                Ok(fresh) => {
+                    c = fresh;
+                    println!("    slot {} holds version 1 and is what is running", ota::slot_name(c.active));
+                }
+                Err(e) => {
+                    println!("  update     : could not initialise — {}", e);
+                    return;
+                }
+            }
+        }
+        ota::Outcome::Trying { slot, version, tries_left, healthy } => {
+            println!(
+                "  update     : booted slot {} version {} on probation, {} tr{} left after this one",
+                ota::slot_name(slot),
+                version,
+                tries_left,
+                if tries_left == 1 { "y" } else { "ies" }
+            );
+            println!("    measured   the slot before running it: digest matches the control block");
+            // The self-test stands in for "did the system come up": a real one
+            // is a set of services reporting in, and it is the same shape of
+            // answer — something the new system does, not something done to it.
+            if healthy {
+                match ota::mark_successful(&f, &mut c) {
+                    Ok(()) => {
+                        confirmed = true;
+                        println!("    self-test  passed — marked successful, probation over");
+                    }
+                    Err(e) => println!("    self-test  passed but could not be recorded — {}", e),
+                }
+            } else {
+                println!("    self-test  FAILED — not confirming; this try is spent either way");
+            }
+        }
+        ota::Outcome::RolledBack { from, to, version } => {
+            println!(
+                "  update     : slot {} ran out of tries — rolled back to slot {}, version {}",
+                ota::slot_name(from),
+                ota::slot_name(to),
+                version
+            );
+            println!("    nobody was there to do it: the counter reached zero and the rule ran");
+        }
+        ota::Outcome::Running { slot, version } => {
+            println!(
+                "  update     : running slot {} version {}, already proved",
+                ota::slot_name(slot),
+                version
+            );
+        }
+        ota::Outcome::Corrupt { slot } => {
+            println!(
+                "  update     : slot {} does not hold what the control block says — refused",
+                ota::slot_name(slot)
+            );
+        }
+    }
+
+    // What an update service would do next. Two updates are offered over the
+    // device's life: a bad one, and then a good one.
+    let running = c.version[c.active];
+    if c.state[c.active] == ota::SlotState::Successful {
+        let target = c.other();
+        if c.rollbacks == 0 && running == 1 {
+            if ota::stage(&f, &mut c, target, 2, false).is_ok() {
+                println!(
+                    "    staged     version 2 into slot {} (it will not come up), {} tries",
+                    ota::slot_name(target),
+                    ota::MAX_TRIES
+                );
+            }
+        } else if c.rollbacks >= 1 && running == 1 {
+            if ota::stage(&f, &mut c, target, 3, true).is_ok() {
+                println!(
+                    "    staged     version 3 into slot {}, {} tries",
+                    ota::slot_name(target),
+                    ota::MAX_TRIES
+                );
+            }
+        }
+    }
+
+    println!("  slots      : control block seq {}, {} rollback(s) so far", c.seq, c.rollbacks);
+    slot_table(&c);
+
+    // The sequence is finished when a bad update has been rolled back and the
+    // one after it has been kept.
+    println!();
+    if c.rollbacks >= 1 && c.version[c.active] == 3 && c.state[c.active] == ota::SlotState::Successful
+    {
+        println!("  RESULT     : PASS — a version that never came up was rolled back after two");
+        println!("               tries with nobody watching, the previous system returned, and");
+        println!("               the next update was kept");
+    } else if confirmed {
+        println!("  update     : this boot confirmed the slot it was trying");
+    } else {
+        println!("  update     : sequence in progress");
     }
 }
 

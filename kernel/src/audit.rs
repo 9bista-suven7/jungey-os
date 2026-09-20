@@ -109,6 +109,11 @@ pub fn init(start: u64, sectors: u64) {
     log.ready = true;
 }
 
+/// Whether there is a log to append to yet.
+pub fn ready() -> bool {
+    LOG.lock().ready
+}
+
 /// Record something that happened.
 ///
 /// `actor` is who did it, `cap` the capability it was done under, `name` what

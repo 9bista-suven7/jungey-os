@@ -75,6 +75,9 @@ for round in $(seq 1 "$REPEAT"); do
     check "task undone byte for byte"    1 "$LOG_DIR/boot1" "byte-for-byte what they were before: true"
     check "tampering detected"           1 "$LOG_DIR/boot1" "chain breaks at"
     check "agent runtime result"         1 "$LOG_DIR/boot1" "RESULT     : PASS — the assistant composed"
+    check "image measured before it runs" 1 "$LOG_DIR/boot1" "bytes  sha256 .*matches the build"
+    check "flipped byte is refused"      1 "$LOG_DIR/boot1" "rejected — it is not the image"
+    check "measured boot result"         1 "$LOG_DIR/boot1" "RESULT     : PASS — the userspace image is measured"
     check "kv survived the flash trip"   1 "$LOG_DIR/boot1" "every byte survived the round trip"
     check "kv policy correct"            1 "$LOG_DIR/boot1" "RESULT     : PASS — the budget held"
     check "model file verified on disk"  1 "$LOG_DIR/boot1" "verified on disk"
@@ -132,6 +135,25 @@ for round in $(seq 1 "$REPEAT"); do
     check "ui result"                      1 "$LOG_DIR/ui" "RESULT     : PASS — every tap reached exactly one window"
     check "no kernel panic"                0 "$LOG_DIR/ui" "KERNEL PANIC"
     check "boot ran to completion"         1 "$LOG_DIR/ui" "stage 6 complete"
+
+    echo "boot 7 — a kernel that expects a different image"
+    # Built with the wrong digest recorded, so the refusal can be watched end
+    # to end rather than asserted. It powers off before the block driver
+    # starts, so it cannot disturb the disk the boots above sequenced.
+    timeout 60 ./run.sh --tamper >"$LOG_DIR/tamper" 2>&1 </dev/null
+    check "mismatch is reported"           1 "$LOG_DIR/tamper" "MISMATCH"
+    check "userspace is refused"           1 "$LOG_DIR/tamper" "refusing to start userspace"
+    check "nothing ran at EL0"             0 "$LOG_DIR/tamper" "wrote its pid to"
+
+    echo "boots 8+ — an update that never comes up, and the one after it"
+    timeout 600 ./tools/otatest.sh --serial "$LOG_DIR/ota" >"$LOG_DIR/otarun" 2>&1 </dev/null
+    check "fresh device initialised"       1 "$LOG_DIR/ota" "this device has never been updated"
+    check "staged into the spare slot"     1 "$LOG_DIR/ota" "staged     version 2 into slot B"
+    check "slot measured before use"       3 "$LOG_DIR/ota" "digest matches the control block"
+    check "a try is spent per boot"        2 "$LOG_DIR/ota" "self-test  FAILED"
+    check "rolled back unattended"         1 "$LOG_DIR/ota" "ran out of tries — rolled back to slot A"
+    check "the next update was kept"       1 "$LOG_DIR/ota" "self-test  passed — marked successful"
+    check "update result"                  1 "$LOG_DIR/ota" "RESULT     : PASS — a version that never came up"
 
 done
 
